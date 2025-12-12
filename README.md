@@ -109,10 +109,9 @@ CollabSync をより快適に使うために、以下の 2 つのツールを併
 - 役割:
   - Unity Editor から、ワンクリックで Python スクリプトを実行するためのツールです。
 - CollabSync との組み合わせ例:
-  - 「CollabSync 用 FileSync スクリプト」を Python で書いておき、
-    - Unity メニューのボタン
-    - もしくはホットキー
-    から **直接 FileSync を叩けるようにする**
+  - 「CollabSync 用 FileSync」の実行を**忘れないように**することができます
+    - Unity からの実行
+    - Unity起動時に実行の提案
   - これにより、
     - Unity 起動 → CollabSync ウィンドウを開く
     - `Tools > PythonRunner > Run FileSync` などを実行
