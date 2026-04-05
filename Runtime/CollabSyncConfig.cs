@@ -41,12 +41,13 @@ namespace Ignoranz.CollabSync
 #if UNITY_EDITOR
         public static CollabSyncConfig LoadOrCreate()
         {
-            var asset = Resources.Load<CollabSyncConfig>("CollabSyncConfig");
+            const string ProjectAssetPath = "Assets/IGNORANZ PROJECT/CollabSync/Runtime/Resources/CollabSyncConfig.asset";
+            var asset = UnityEditor.AssetDatabase.LoadAssetAtPath<CollabSyncConfig>(ProjectAssetPath);
             if (!asset)
             {
                 asset = ScriptableObject.CreateInstance<CollabSyncConfig>();
                 System.IO.Directory.CreateDirectory("Assets/IGNORANZ PROJECT/CollabSync/Runtime/Resources");
-                UnityEditor.AssetDatabase.CreateAsset(asset, "Assets/IGNORANZ PROJECT/CollabSync/Runtime/Resources/CollabSyncConfig.asset");
+                UnityEditor.AssetDatabase.CreateAsset(asset, ProjectAssetPath);
                 UnityEditor.AssetDatabase.SaveAssets();
             }
             return asset;
