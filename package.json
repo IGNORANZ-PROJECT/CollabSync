@@ -1,0 +1,22 @@
+{
+  "name": "com.ignoranz.collabsync",
+  "version": "0.0.1",
+  "displayName": "CollabSync",
+  "description": "Lightweight collaboration support for Unity Editor using a shared JSON file.",
+  "unity": "2021.3",
+  "author": {
+    "name": "IGNORANZ PROJECT"
+  },
+  "license": "MIT",
+  "documentationUrl": "https://github.com/IGNORANZ-PROJECT/CollabSync",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/IGNORANZ-PROJECT/CollabSync.git"
+  },
+  "keywords": [
+    "unity",
+    "collaboration",
+    "editor",
+    "tool"
+  ]
+}
