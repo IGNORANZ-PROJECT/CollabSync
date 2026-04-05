@@ -33,11 +33,28 @@ namespace Ignoranz.CollabSync
             }
         }
 
+        readonly struct LanguageModeResolution
+        {
+            public readonly CollabSyncLanguageMode configuredMode;
+            public readonly CollabSyncLanguageMode resolvedMode;
+
+            public LanguageModeResolution(CollabSyncLanguageMode configuredMode, CollabSyncLanguageMode resolvedMode)
+            {
+                this.configuredMode = configuredMode;
+                this.resolvedMode = resolvedMode;
+            }
+        }
+
         static readonly object s_autoLanguageLock = new();
+        static readonly object s_languageModeLock = new();
         static readonly TimeSpan s_autoLanguageCacheDuration = TimeSpan.FromSeconds(10);
+        static readonly TimeSpan s_languageModeCacheDuration = TimeSpan.FromSeconds(1);
         static AutoLanguageResolution s_cachedAutoLanguage;
         static DateTime s_autoLanguageCachedAtUtc;
         static bool s_hasAutoLanguageCache;
+        static LanguageModeResolution s_cachedLanguageMode;
+        static DateTime s_languageModeCachedAtUtc;
+        static bool s_hasLanguageModeCache;
 
         public static bool UseJapanese => GetResolvedLanguageMode() == CollabSyncLanguageMode.Japanese;
         public static CollabSyncLanguageMode CurrentLanguageMode => GetResolvedLanguageMode();
@@ -55,8 +72,9 @@ namespace Ignoranz.CollabSync
 
         public static string GetLanguageStatusSummary()
         {
-            var configuredMode = LoadConfiguredLanguageMode();
-            var resolvedMode = GetResolvedLanguageMode();
+            var languageModes = GetCachedLanguageModes();
+            var configuredMode = languageModes.configuredMode;
+            var resolvedMode = languageModes.resolvedMode;
 
             if (configuredMode == CollabSyncLanguageMode.English)
                 return T("Current language: English (manual).", "現在の言語: 英語（手動設定）");
@@ -119,16 +137,35 @@ namespace Ignoranz.CollabSync
 
         static CollabSyncLanguageMode GetResolvedLanguageMode()
         {
-            var configuredMode = LoadConfiguredLanguageMode();
-            if (configuredMode == CollabSyncLanguageMode.English)
-                return CollabSyncLanguageMode.English;
-            if (configuredMode == CollabSyncLanguageMode.Japanese)
-                return CollabSyncLanguageMode.Japanese;
-
-            return ResolveAutoLanguageMode();
+            return GetCachedLanguageModes().resolvedMode;
         }
 
         static CollabSyncLanguageMode LoadConfiguredLanguageMode()
+        {
+            return GetCachedLanguageModes().configuredMode;
+        }
+
+        static LanguageModeResolution GetCachedLanguageModes()
+        {
+            lock (s_languageModeLock)
+            {
+                var now = DateTime.UtcNow;
+                if (s_hasLanguageModeCache && now - s_languageModeCachedAtUtc <= s_languageModeCacheDuration)
+                    return s_cachedLanguageMode;
+
+                var configuredMode = LoadConfiguredLanguageModeUncached();
+                var resolvedMode = configuredMode == CollabSyncLanguageMode.Auto
+                    ? ResolveAutoLanguageMode()
+                    : configuredMode;
+
+                s_cachedLanguageMode = new LanguageModeResolution(configuredMode, resolvedMode);
+                s_languageModeCachedAtUtc = now;
+                s_hasLanguageModeCache = true;
+                return s_cachedLanguageMode;
+            }
+        }
+
+        static CollabSyncLanguageMode LoadConfiguredLanguageModeUncached()
         {
 #if UNITY_EDITOR
             var cfg = CollabSyncConfig.LoadOrCreate();
@@ -136,6 +173,19 @@ namespace Ignoranz.CollabSync
             var cfg = Resources.Load<CollabSyncConfig>("CollabSyncConfig");
 #endif
             return cfg != null ? cfg.languageMode : CollabSyncLanguageMode.Auto;
+        }
+
+        public static void InvalidateCaches()
+        {
+            lock (s_languageModeLock)
+            {
+                s_hasLanguageModeCache = false;
+            }
+
+            lock (s_autoLanguageLock)
+            {
+                s_hasAutoLanguageCache = false;
+            }
         }
 
         static CollabSyncLanguageMode ResolveAutoLanguageMode()

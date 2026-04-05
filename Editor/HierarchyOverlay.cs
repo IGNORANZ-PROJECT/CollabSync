@@ -2,7 +2,7 @@
 using UnityEditor;
 using UnityEngine;
 using System;
-using System.Linq;
+using System.Collections.Generic;
 using Ignoranz.CollabSync;
 
 [InitializeOnLoad]
@@ -12,6 +12,9 @@ public static class HierarchyOverlay
     static CollabSyncConfig   _cfg;
     static ICollabBackend     _backend;
     static CollabStateDocument _doc = new();
+    static readonly Dictionary<string, HashSet<string>> _presenceUsersByScene = new(StringComparer.Ordinal);
+    static readonly Dictionary<string, LockItem> _activeLocksByPath = new(StringComparer.Ordinal);
+    static bool _hasObjectLocks;
 
     static HierarchyOverlay()
     {
@@ -61,7 +64,51 @@ public static class HierarchyOverlay
     static void OnDocUpdate(CollabStateDocument doc)
     {
         _doc = doc ?? new CollabStateDocument();
+        RebuildCaches();
         EditorApplication.RepaintHierarchyWindow();
+    }
+
+    static void RebuildCaches()
+    {
+        _presenceUsersByScene.Clear();
+        _activeLocksByPath.Clear();
+        _hasObjectLocks = false;
+
+        var now = TimeUtil.NowMs();
+        foreach (var presence in _doc.presences ?? new List<EditingPresence>())
+        {
+            if (presence == null || string.IsNullOrEmpty(presence.assetPath))
+                continue;
+            if (now - presence.heartbeat >= 10_000)
+                continue;
+
+            if (!_presenceUsersByScene.TryGetValue(presence.assetPath, out var users))
+            {
+                users = new HashSet<string>(StringComparer.Ordinal);
+                _presenceUsersByScene[presence.assetPath] = users;
+            }
+
+            users.Add(GetUserKey(presence.userId, presence.user));
+        }
+
+        foreach (var lockItem in _doc.locks ?? new List<LockItem>())
+        {
+            if (lockItem == null || string.IsNullOrEmpty(lockItem.assetPath))
+                continue;
+            if (!CollabSyncEditorLockUtility.IsLockActive(lockItem, now))
+                continue;
+
+            _activeLocksByPath[lockItem.assetPath] = lockItem;
+            _hasObjectLocks |= lockItem.assetPath.StartsWith("obj:", StringComparison.Ordinal);
+        }
+    }
+
+    static string GetUserKey(string userId, string userName)
+    {
+        userId = CollabIdentityUtility.Normalize(userId);
+        return string.IsNullOrEmpty(userId)
+            ? "legacy:" + CollabIdentityUtility.DisplayName(userId, userName)
+            : userId;
     }
 
     static void OnItemGUI(int instanceID, Rect selectionRect)
@@ -73,42 +120,45 @@ public static class HierarchyOverlay
 
             var scenePath = go.scene.path;
             if (string.IsNullOrEmpty(scenePath)) return;
-            var objectKey = CollabSyncEditorLockUtility.GetGameObjectLockKey(go);
+            if (!_presenceUsersByScene.ContainsKey(scenePath) && !_activeLocksByPath.ContainsKey(scenePath) && !_hasObjectLocks)
+                return;
 
-            long now = TimeUtil.NowMs();
+            var objectKey = _hasObjectLocks ? CollabSyncEditorLockUtility.GetGameObjectLockKey(go) : null;
+
             var meId = CollabSyncUser.UserId;
             var meName = CollabSyncUser.UserName;
+            var meKey = GetUserKey(meId, meName);
 
-            bool someoneEditing = _doc.presences.Any(p =>
-                string.Equals(p.assetPath, scenePath, StringComparison.Ordinal) &&
-                (now - p.heartbeat) < 10_000 &&
-                !CollabIdentityUtility.Matches(meId, meName, p.userId, p.user));
-
-            bool AffectsThisItem(LockItem lockItem)
+            bool someoneEditing = false;
+            if (_presenceUsersByScene.TryGetValue(scenePath, out var presenceUsers))
             {
-                if (!CollabSyncEditorLockUtility.IsLockActive(lockItem, now))
-                    return false;
-
-                if (!string.IsNullOrEmpty(objectKey) &&
-                    string.Equals(lockItem.assetPath, objectKey, StringComparison.Ordinal))
+                foreach (var userKey in presenceUsers)
                 {
-                    return true;
+                    if (!string.Equals(userKey, meKey, StringComparison.Ordinal))
+                    {
+                        someoneEditing = true;
+                        break;
+                    }
                 }
-
-                return string.Equals(lockItem.assetPath, scenePath, StringComparison.Ordinal);
             }
 
-            var lockByOther = _doc.locks.FirstOrDefault(l =>
-                l != null &&
-                AffectsThisItem(l) &&
-                !CollabIdentityUtility.Matches(meId, meName, l.ownerId, l.owner));
+            LockItem lockByOther = null;
+            LockItem lockByMe = null;
+            if (!string.IsNullOrEmpty(objectKey) && _activeLocksByPath.TryGetValue(objectKey, out var objectLock))
+            {
+                if (CollabIdentityUtility.Matches(meId, meName, objectLock.ownerId, objectLock.owner))
+                    lockByMe = objectLock;
+                else
+                    lockByOther = objectLock;
+            }
 
-            var lockByMe = lockByOther == null
-                ? _doc.locks.FirstOrDefault(l =>
-                    l != null &&
-                    AffectsThisItem(l) &&
-                    CollabIdentityUtility.Matches(meId, meName, l.ownerId, l.owner))
-                : null;
+            if (lockByOther == null && _activeLocksByPath.TryGetValue(scenePath, out var sceneLock))
+            {
+                if (CollabIdentityUtility.Matches(meId, meName, sceneLock.ownerId, sceneLock.owner))
+                    lockByMe ??= sceneLock;
+                else
+                    lockByOther = sceneLock;
+            }
 
             if (lockByOther != null || lockByMe != null || someoneEditing)
             {

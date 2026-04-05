@@ -12,6 +12,7 @@ namespace Ignoranz.CollabSync
     {
         const int FileAccessRetryCount = 40;
         const int FileAccessRetryDelayMs = 100;
+        const int RaiseDebounceDelayMs = 75;
         const int MaxBackupFiles = 24;
         const int MaxHistoryItems = 160;
         const long HistoryDuplicateWindowMs = 3000;
@@ -23,6 +24,8 @@ namespace Ignoranz.CollabSync
         FileSystemWatcher _watcher;
         Action<CollabStateDocument> _onUpdate;
         bool _disposed;
+        int _raiseVersion;
+        long _lastRaisedUpdatedAt = long.MinValue;
 
         public LocalJsonBackend(string jsonPath)
         {
@@ -44,9 +47,9 @@ namespace Ignoranz.CollabSync
                 {
                     NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName
                 };
-                _watcher.Changed += (_, __) => Raise();
-                _watcher.Created += (_, __) => Raise();
-                _watcher.Renamed += (_, __) => Raise();
+                _watcher.Changed += (_, __) => RequestRaise();
+                _watcher.Created += (_, __) => RequestRaise();
+                _watcher.Renamed += (_, __) => RequestRaise();
                 _watcher.EnableRaisingEvents = true;
             }
             catch
@@ -606,6 +609,10 @@ namespace Ignoranz.CollabSync
             try
             {
                 var doc = ReadDoc();
+                if (doc != null && doc.updatedAt > 0 && doc.updatedAt == _lastRaisedUpdatedAt)
+                    return;
+
+                _lastRaisedUpdatedAt = doc?.updatedAt ?? long.MinValue;
                 _onUpdate?.Invoke(doc);
                 CollabSyncEvents.RaiseDocUpdate(doc);
             }
@@ -614,10 +621,43 @@ namespace Ignoranz.CollabSync
             }
         }
 
+        void RequestRaise(bool immediate = false)
+        {
+            if (_disposed)
+                return;
+
+            var version = Interlocked.Increment(ref _raiseVersion);
+            if (immediate)
+            {
+                RaiseIfLatest(version);
+                return;
+            }
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(RaiseDebounceDelayMs).ConfigureAwait(false);
+                    RaiseIfLatest(version);
+                }
+                catch
+                {
+                }
+            });
+        }
+
+        void RaiseIfLatest(int version)
+        {
+            if (_disposed || version != Volatile.Read(ref _raiseVersion))
+                return;
+
+            Raise();
+        }
+
         public void Subscribe(Action<CollabStateDocument> onUpdate)
         {
             _onUpdate = onUpdate;
-            Raise();
+            RequestRaise(immediate: true);
         }
 
         public Task<CollabStateDocument> LoadOnceAsync() => Task.FromResult(ReadDoc());

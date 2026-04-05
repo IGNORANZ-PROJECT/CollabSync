@@ -2,7 +2,7 @@
 using UnityEditor;
 using UnityEngine;
 using System;
-using System.Linq;
+using System.Collections.Generic;
 using Ignoranz.CollabSync;
 
 [InitializeOnLoad]
@@ -12,6 +12,8 @@ public static class ProjectOverlay
     static CollabSyncConfig   _cfg;
     static ICollabBackend     _backend;
     static CollabStateDocument _doc = new();
+    static readonly Dictionary<string, LockItem> _exactLocks = new(StringComparer.Ordinal);
+    static readonly List<LockItem> _folderLocks = new();
 
     static ProjectOverlay()
     {
@@ -61,7 +63,30 @@ public static class ProjectOverlay
     static void OnDocUpdate(CollabStateDocument doc)
     {
         _doc = doc ?? new CollabStateDocument();
+        RebuildLockCache();
         EditorApplication.RepaintProjectWindow();
+    }
+
+    static void RebuildLockCache()
+    {
+        _exactLocks.Clear();
+        _folderLocks.Clear();
+
+        var now = TimeUtil.NowMs();
+        foreach (var lockItem in _doc.locks ?? new List<LockItem>())
+        {
+            if (lockItem == null || !CollabSyncEditorLockUtility.IsLockActive(lockItem, now))
+                continue;
+            if (string.IsNullOrEmpty(lockItem.assetPath) || lockItem.assetPath.StartsWith("obj:", StringComparison.Ordinal))
+                continue;
+
+            if (lockItem.assetPath.EndsWith("/", StringComparison.Ordinal))
+                _folderLocks.Add(lockItem);
+            else
+                _exactLocks[lockItem.assetPath] = lockItem;
+        }
+
+        _folderLocks.Sort((a, b) => string.CompareOrdinal(b.assetPath ?? "", a.assetPath ?? ""));
     }
 
     static void OnItemGUI(string guid, Rect rect)
@@ -70,24 +95,39 @@ public static class ProjectOverlay
         {
             var path = AssetDatabase.GUIDToAssetPath(guid);
             if (string.IsNullOrEmpty(path)) return;
+            if (_exactLocks.Count == 0 && _folderLocks.Count == 0) return;
 
-            long now = TimeUtil.NowMs();
             var meId = CollabSyncUser.UserId;
             var meName = CollabSyncUser.UserName;
+            LockItem lockByOther = null;
+            LockItem lockByMe = null;
 
-            var lockByOther = _doc.locks.FirstOrDefault(l =>
-                l != null &&
-                CollabSyncEditorLockUtility.IsLockActive(l, now) &&
-                CollabSyncEditorLockUtility.DoesLockAffectProjectPath(l, path) &&
-                !CollabIdentityUtility.Matches(meId, meName, l.ownerId, l.owner));
+            if (_exactLocks.TryGetValue(path, out var exactLock))
+            {
+                if (CollabIdentityUtility.Matches(meId, meName, exactLock.ownerId, exactLock.owner))
+                    lockByMe = exactLock;
+                else
+                    lockByOther = exactLock;
+            }
 
-            var lockByMe = lockByOther == null
-                ? _doc.locks.FirstOrDefault(l =>
-                    l != null &&
-                    CollabSyncEditorLockUtility.IsLockActive(l, now) &&
-                    CollabSyncEditorLockUtility.DoesLockAffectProjectPath(l, path) &&
-                    CollabIdentityUtility.Matches(meId, meName, l.ownerId, l.owner))
-                : null;
+            if (lockByOther == null)
+            {
+                foreach (var folderLock in _folderLocks)
+                {
+                    if (!CollabSyncEditorLockUtility.DoesLockAffectProjectPath(folderLock, path))
+                        continue;
+
+                    if (CollabIdentityUtility.Matches(meId, meName, folderLock.ownerId, folderLock.owner))
+                    {
+                        lockByMe ??= folderLock;
+                    }
+                    else
+                    {
+                        lockByOther = folderLock;
+                        break;
+                    }
+                }
+            }
 
             if (lockByOther != null || lockByMe != null)
             {

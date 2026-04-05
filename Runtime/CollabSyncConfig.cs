@@ -17,6 +17,9 @@ namespace Ignoranz.CollabSync
     public class CollabSyncConfig : ScriptableObject
     {
         const string ProjectLocalEditorAssetPath = "Assets/IGNORANZ-PROJECT/CollabSyncSettings/Resources/CollabSyncConfig.asset";
+#if UNITY_EDITOR
+        static CollabSyncConfig s_cachedEditorAsset;
+#endif
 
         public string projectId = "IGNORANZ_PROJECT_DEFAULT";
 
@@ -47,6 +50,9 @@ namespace Ignoranz.CollabSync
 #if UNITY_EDITOR
         public static CollabSyncConfig LoadOrCreate()
         {
+            if (s_cachedEditorAsset != null)
+                return s_cachedEditorAsset;
+
             var asset = FindProjectLocalEditorAsset();
             if (!asset)
                 asset = TryCreateProjectLocalCopyFromPackagedAsset();
@@ -59,11 +65,22 @@ namespace Ignoranz.CollabSync
                 AssetDatabase.CreateAsset(asset, assetPath);
                 AssetDatabase.SaveAssets();
             }
+
+            s_cachedEditorAsset = asset;
             return asset;
         }
 
         static CollabSyncConfig FindProjectLocalEditorAsset()
         {
+            if (s_cachedEditorAsset != null)
+            {
+                var cachedPath = AssetDatabase.GetAssetPath(s_cachedEditorAsset);
+                if (IsProjectLocalEditorAssetPath(cachedPath))
+                    return s_cachedEditorAsset;
+
+                s_cachedEditorAsset = null;
+            }
+
             var existingGuids = AssetDatabase.FindAssets("t:CollabSyncConfig CollabSyncConfig");
             foreach (var guid in existingGuids)
             {
@@ -73,7 +90,10 @@ namespace Ignoranz.CollabSync
 
                 var loaded = AssetDatabase.LoadAssetAtPath<CollabSyncConfig>(path);
                 if (loaded != null)
+                {
+                    s_cachedEditorAsset = loaded;
                     return loaded;
+                }
             }
 
             return null;
@@ -117,6 +137,7 @@ namespace Ignoranz.CollabSync
             Directory.CreateDirectory(Path.GetDirectoryName(assetPath) ?? "Assets");
             AssetDatabase.CreateAsset(asset, assetPath);
             AssetDatabase.SaveAssets();
+            s_cachedEditorAsset = asset;
             return asset;
         }
 

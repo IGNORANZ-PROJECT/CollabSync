@@ -103,6 +103,16 @@ public class CollabSyncWindow : EditorWindow
     private string _adminUserIdInput = "";
     private readonly List<string> _pendingMemoAlertIds = new();
     private readonly HashSet<string> _dismissedMemoAlertIds = new();
+    private readonly List<EditingPresence> _cachedAlivePresences = new();
+    private readonly List<LockItem> _cachedActiveLocks = new();
+    private readonly List<KnownUserInfo> _cachedKnownUsers = new();
+    private readonly List<KnownUserInfo> _cachedAdminUsers = new();
+    private readonly Dictionary<string, EditingPresence> _cachedPresenceByUserKey = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, List<LockItem>> _cachedLocksByUserKey = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _cachedAdminUserKeys = new(StringComparer.Ordinal);
+    private long _derivedDocUpdatedAt = long.MinValue;
+    private long _derivedTimeBucket = long.MinValue;
+    private string _derivedIdentityKey = "";
 
     private GUIStyle _cardValueStyle;
     private GUIStyle _cardValueButtonStyle;
@@ -112,6 +122,7 @@ public class CollabSyncWindow : EditorWindow
     private GUIStyle _memoPreviewStyle;
 
     private const long PresenceAliveWindowMs = 20_000;
+    private const long DerivedDataRefreshWindowMs = 500;
     private static readonly Regex MemoMarkdownFenceRegex = new(@"```(?:[^\n`]*)\n?([\s\S]*?)```", RegexOptions.Compiled);
     private static readonly Regex MemoMarkdownInlineCodeRegex = new(@"`([^`\n]+)`", RegexOptions.Compiled);
     private static readonly Regex MemoMarkdownLinkRegex = new(@"\[([^\]]+)\]\(([^)]+)\)", RegexOptions.Compiled);
@@ -145,6 +156,7 @@ public class CollabSyncWindow : EditorWindow
 
         _doc = NormalizeWindowDoc(_doc);
         _doc = NormalizeWindowDoc(CollabSyncEvents.Latest ?? new CollabStateDocument());
+        InvalidateDerivedData();
         foreach (var m in _doc.memos)
         {
             if (!string.IsNullOrEmpty(m.id))
@@ -212,6 +224,7 @@ public class CollabSyncWindow : EditorWindow
     private void OnDocUpdate(CollabStateDocument doc)
     {
         _doc = NormalizeWindowDoc(doc);
+        InvalidateDerivedData();
         PruneMemoAlerts();
 
         if (NotifyOnNewMemo && _doc.memos != null)
@@ -716,6 +729,7 @@ public class CollabSyncWindow : EditorWindow
     {
         var users = GetKnownUsers(alive, activeLocks);
         var onlineCount = users.Count(user => user.isOnline);
+        var now = TimeUtil.NowMs();
 
         using (new GUILayout.VerticalScope("box"))
         {
@@ -735,15 +749,17 @@ public class CollabSyncWindow : EditorWindow
             return;
         }
 
-        var now = TimeUtil.NowMs();
         foreach (var user in users)
         {
-            var currentPresence = alive.FirstOrDefault(p => CollabIdentityUtility.Matches(user.userId, user.displayName, p.userId, p.user));
-            var userLocks = activeLocks.Where(l => CollabIdentityUtility.Matches(user.userId, user.displayName, l.ownerId, l.owner)).ToList();
+            var userKey = UserKey(user.userId, user.displayName);
+            _cachedPresenceByUserKey.TryGetValue(userKey, out var currentPresence);
+            var userLocks = _cachedLocksByUserKey.TryGetValue(userKey, out var cachedLocks)
+                ? cachedLocks
+                : new List<LockItem>();
             var historyKey = UserKey(user.userId, user.displayName);
             bool expanded = _expandedUserHistories.Contains(historyKey);
             bool isRootAdmin = CollabIdentityUtility.Matches(user.userId, user.displayName, GetRootAdminUserId(), GetRootAdminUserName());
-            bool isAdmin = GetAdminUsers().Any(admin => CollabIdentityUtility.Matches(user.userId, user.displayName, admin.userId, admin.displayName));
+            bool isAdmin = _cachedAdminUserKeys.Contains(userKey);
             bool canDeleteUser = IsCurrentUserRootAdmin() &&
                                  !isRootAdmin &&
                                  !IsCurrentUser(user.userId, user.displayName) &&
@@ -1917,6 +1933,7 @@ public class CollabSyncWindow : EditorWindow
             _cfg.languageMode = (CollabSyncLanguageMode)Mathf.Clamp(nextMode, 0, 2);
             EditorUtility.SetDirty(_cfg);
             AssetDatabase.SaveAssets();
+            CollabSyncLocalization.InvalidateCaches();
             Repaint();
         }
 
@@ -2246,6 +2263,183 @@ public class CollabSyncWindow : EditorWindow
         return doc;
     }
 
+    private void InvalidateDerivedData()
+    {
+        _derivedDocUpdatedAt = long.MinValue;
+        _derivedTimeBucket = long.MinValue;
+        _derivedIdentityKey = "";
+    }
+
+    private void EnsureDerivedData()
+    {
+        var doc = _doc ?? new CollabStateDocument();
+        var now = TimeUtil.NowMs();
+        var timeBucket = now / DerivedDataRefreshWindowMs;
+        var identityKey = CurrentUserId + "\n" + CurrentUserName;
+        if (_derivedDocUpdatedAt == doc.updatedAt
+            && _derivedTimeBucket == timeBucket
+            && string.Equals(_derivedIdentityKey, identityKey, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        _cachedAlivePresences.Clear();
+        _cachedActiveLocks.Clear();
+        _cachedKnownUsers.Clear();
+        _cachedAdminUsers.Clear();
+        _cachedPresenceByUserKey.Clear();
+        _cachedLocksByUserKey.Clear();
+        _cachedAdminUserKeys.Clear();
+
+        var adminNames = doc.adminUsers ?? new List<string>();
+        var adminIds = doc.adminUserIds ?? new List<string>();
+        for (int i = 0; i < adminNames.Count; i++)
+        {
+            var userId = i < adminIds.Count ? adminIds[i] ?? "" : "";
+            var displayName = CollabIdentityUtility.DisplayName(userId, adminNames[i]);
+            if (string.IsNullOrEmpty(userId) && string.IsNullOrEmpty(displayName))
+                continue;
+
+            _cachedAdminUsers.Add(new KnownUserInfo
+            {
+                userId = userId,
+                displayName = displayName
+            });
+        }
+
+        _cachedAdminUsers.Sort((a, b) => string.Compare(a.displayName, b.displayName, StringComparison.OrdinalIgnoreCase));
+        foreach (var admin in _cachedAdminUsers)
+            _cachedAdminUserKeys.Add(UserKey(admin.userId, admin.displayName));
+
+        var latestPresences = new Dictionary<string, EditingPresence>(StringComparer.Ordinal);
+        foreach (var presence in doc.presences ?? new List<EditingPresence>())
+        {
+            if (presence == null || now - presence.heartbeat >= PresenceAliveWindowMs)
+                continue;
+
+            var key = UserKey(presence.userId, presence.user);
+            if (!latestPresences.TryGetValue(key, out var existing) || existing.heartbeat < presence.heartbeat)
+                latestPresences[key] = presence;
+        }
+
+        if (EditingTracker.TryGetLastPublishedPresence(out var localPresence)
+            && localPresence != null
+            && now - localPresence.heartbeat < PresenceAliveWindowMs
+            && IsCurrentUser(localPresence.userId, localPresence.user))
+        {
+            var key = UserKey(localPresence.userId, localPresence.user);
+            if (!latestPresences.TryGetValue(key, out var existing) || existing.heartbeat < localPresence.heartbeat)
+                latestPresences[key] = localPresence;
+        }
+
+        foreach (var presence in latestPresences.Values)
+        {
+            _cachedAlivePresences.Add(presence);
+            _cachedPresenceByUserKey[UserKey(presence.userId, presence.user)] = presence;
+        }
+
+        _cachedAlivePresences.Sort((a, b) =>
+        {
+            var byAsset = string.Compare(a?.assetPath ?? "", b?.assetPath ?? "", StringComparison.Ordinal);
+            if (byAsset != 0)
+                return byAsset;
+            return string.Compare(DisplayUser(a?.userId, a?.user) ?? "", DisplayUser(b?.userId, b?.user) ?? "", StringComparison.OrdinalIgnoreCase);
+        });
+
+        foreach (var lockItem in doc.locks ?? new List<LockItem>())
+        {
+            if (lockItem == null)
+                continue;
+            if (lockItem.ttlMs > 0 && now - lockItem.createdAt > lockItem.ttlMs)
+                continue;
+
+            _cachedActiveLocks.Add(lockItem);
+            var key = UserKey(lockItem.ownerId, lockItem.owner);
+            if (!_cachedLocksByUserKey.TryGetValue(key, out var list))
+            {
+                list = new List<LockItem>();
+                _cachedLocksByUserKey[key] = list;
+            }
+            list.Add(lockItem);
+        }
+
+        _cachedActiveLocks.Sort((a, b) =>
+        {
+            var byAsset = string.Compare(a?.assetPath ?? "", b?.assetPath ?? "", StringComparison.Ordinal);
+            if (byAsset != 0)
+                return byAsset;
+            return string.Compare(DisplayUser(a?.ownerId, a?.owner) ?? "", DisplayUser(b?.ownerId, b?.owner) ?? "", StringComparison.OrdinalIgnoreCase);
+        });
+
+        var knownUsers = new Dictionary<string, KnownUserInfo>(StringComparer.Ordinal);
+        void AddKnownUser(string userId, string displayName, bool isOnline = false)
+        {
+            userId = CollabIdentityUtility.Normalize(userId);
+            displayName = CollabIdentityUtility.DisplayName(userId, displayName);
+            if (string.IsNullOrEmpty(userId) && string.IsNullOrEmpty(displayName))
+                return;
+
+            var key = string.IsNullOrEmpty(userId) ? "legacy:" + displayName : userId;
+            if (!string.IsNullOrEmpty(userId) && !knownUsers.ContainsKey(key))
+            {
+                var legacyKey = "legacy:" + displayName;
+                if (knownUsers.TryGetValue(legacyKey, out var legacyExisting) && string.IsNullOrEmpty(legacyExisting.userId))
+                {
+                    knownUsers.Remove(legacyKey);
+                    legacyExisting.userId = userId;
+                    knownUsers[key] = legacyExisting;
+                }
+            }
+
+            if (!knownUsers.TryGetValue(key, out var existing))
+            {
+                knownUsers[key] = new KnownUserInfo
+                {
+                    userId = userId,
+                    displayName = displayName,
+                    isOnline = isOnline
+                };
+                return;
+            }
+
+            if (string.IsNullOrEmpty(existing.userId) && !string.IsNullOrEmpty(userId))
+                existing.userId = userId;
+            if (!string.IsNullOrEmpty(displayName))
+                existing.displayName = displayName;
+            existing.isOnline |= isOnline;
+        }
+
+        foreach (var presence in _cachedAlivePresences)
+            AddKnownUser(presence?.userId, presence?.user, true);
+        foreach (var lockItem in _cachedActiveLocks)
+            AddKnownUser(lockItem?.ownerId, lockItem?.owner);
+        foreach (var memo in doc.memos ?? new List<MemoItem>())
+            AddKnownUser(memo?.authorId, memo?.author);
+        foreach (var item in doc.history ?? new List<WorkHistoryItem>())
+            AddKnownUser(item?.userId, item?.user);
+        foreach (var admin in _cachedAdminUsers)
+            AddKnownUser(admin.userId, admin.displayName);
+        AddKnownUser(doc.rootAdminUserId, doc.rootAdminUser);
+
+        foreach (var user in knownUsers.Values)
+        {
+            if (!IsBlockedUser(user.userId, user.displayName))
+                _cachedKnownUsers.Add(user);
+        }
+
+        _cachedKnownUsers.Sort((a, b) =>
+        {
+            var byOnline = b.isOnline.CompareTo(a.isOnline);
+            if (byOnline != 0)
+                return byOnline;
+            return string.Compare(a.displayName, b.displayName, StringComparison.OrdinalIgnoreCase);
+        });
+
+        _derivedDocUpdatedAt = doc.updatedAt;
+        _derivedTimeBucket = timeBucket;
+        _derivedIdentityKey = identityKey;
+    }
+
     private string[] GetMemoReaderDisplayNames(MemoItem memo)
     {
         if (memo == null)
@@ -2279,129 +2473,26 @@ public class CollabSyncWindow : EditorWindow
 
     private List<EditingPresence> GetAlivePresences()
     {
-        var now = TimeUtil.NowMs();
-        var alive = (_doc?.presences ?? new List<EditingPresence>())
-            .Where(p => p != null && now - p.heartbeat < PresenceAliveWindowMs)
-            .ToList();
-
-        if (EditingTracker.TryGetLastPublishedPresence(out var localPresence)
-            && localPresence != null
-            && now - localPresence.heartbeat < PresenceAliveWindowMs
-            && IsCurrentUser(localPresence.userId, localPresence.user))
-        {
-            var existingIndex = alive.FindIndex(p => p != null && CollabIdentityUtility.Matches(localPresence.userId, localPresence.user, p.userId, p.user));
-            if (existingIndex >= 0)
-            {
-                if (alive[existingIndex].heartbeat < localPresence.heartbeat)
-                    alive[existingIndex] = localPresence;
-            }
-            else
-            {
-                alive.Add(localPresence);
-            }
-        }
-
-        return alive
-            .GroupBy(p => UserKey(p.userId, p.user))
-            .Select(group => group.OrderByDescending(p => p.heartbeat).First())
-            .OrderBy(p => p.assetPath ?? "")
-            .ThenBy(p => DisplayUser(p.userId, p.user) ?? "", StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        EnsureDerivedData();
+        return _cachedAlivePresences;
     }
 
     private List<LockItem> GetActiveLocks()
     {
-        var now = TimeUtil.NowMs();
-        return (_doc?.locks ?? new List<LockItem>())
-            .Where(l => l != null && (l.ttlMs <= 0 || now - l.createdAt <= l.ttlMs))
-            .OrderBy(l => l.assetPath ?? "")
-            .ThenBy(l => DisplayUser(l.ownerId, l.owner) ?? "", StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        EnsureDerivedData();
+        return _cachedActiveLocks;
     }
 
     private List<KnownUserInfo> GetKnownUsers(List<EditingPresence> alive, List<LockItem> activeLocks)
     {
-        var map = new Dictionary<string, KnownUserInfo>(StringComparer.Ordinal);
-
-        void AddUser(string userId, string displayName, bool isOnline = false)
-        {
-            userId = CollabIdentityUtility.Normalize(userId);
-            displayName = CollabIdentityUtility.DisplayName(userId, displayName);
-            if (string.IsNullOrEmpty(userId) && string.IsNullOrEmpty(displayName))
-                return;
-
-            var key = string.IsNullOrEmpty(userId) ? "legacy:" + displayName : userId;
-            if (!string.IsNullOrEmpty(userId) && !map.ContainsKey(key))
-            {
-                var legacyKey = "legacy:" + displayName;
-                if (map.TryGetValue(legacyKey, out var legacyExisting) && string.IsNullOrEmpty(legacyExisting.userId))
-                {
-                    map.Remove(legacyKey);
-                    legacyExisting.userId = userId;
-                    map[key] = legacyExisting;
-                }
-            }
-
-            if (!map.TryGetValue(key, out var existing))
-            {
-                existing = new KnownUserInfo
-                {
-                    userId = userId,
-                    displayName = displayName,
-                    isOnline = isOnline
-                };
-                map[key] = existing;
-                return;
-            }
-
-            if (string.IsNullOrEmpty(existing.userId) && !string.IsNullOrEmpty(userId))
-                existing.userId = userId;
-            if (!string.IsNullOrEmpty(displayName))
-                existing.displayName = displayName;
-            existing.isOnline |= isOnline;
-        }
-
-        foreach (var presence in alive ?? new List<EditingPresence>())
-            AddUser(presence?.userId, presence?.user, true);
-        foreach (var lockItem in activeLocks ?? new List<LockItem>())
-            AddUser(lockItem?.ownerId, lockItem?.owner);
-        foreach (var memo in _doc?.memos ?? new List<MemoItem>())
-            AddUser(memo?.authorId, memo?.author);
-        foreach (var item in _doc?.history ?? new List<WorkHistoryItem>())
-            AddUser(item?.userId, item?.user);
-        foreach (var admin in GetAdminUsers())
-            AddUser(admin.userId, admin.displayName);
-        AddUser(GetRootAdminUserId(), GetRootAdminUserName());
-
-        return map.Values
-            .Where(x => !IsBlockedUser(x.userId, x.displayName))
-            .OrderByDescending(x => x.isOnline)
-            .ThenBy(x => x.displayName, StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        EnsureDerivedData();
+        return _cachedKnownUsers;
     }
 
     private List<KnownUserInfo> GetAdminUsers()
     {
-        var list = new List<KnownUserInfo>();
-        var names = _doc?.adminUsers ?? new List<string>();
-        var ids = _doc?.adminUserIds ?? new List<string>();
-        for (int i = 0; i < names.Count; i++)
-        {
-            var displayName = CollabIdentityUtility.DisplayName(i < ids.Count ? ids[i] : "", names[i]);
-            var userId = i < ids.Count ? ids[i] ?? "" : "";
-            if (string.IsNullOrEmpty(displayName) && string.IsNullOrEmpty(userId))
-                continue;
-
-            list.Add(new KnownUserInfo
-            {
-                userId = userId,
-                displayName = displayName
-            });
-        }
-
-        return list
-            .OrderBy(x => x.displayName, StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        EnsureDerivedData();
+        return _cachedAdminUsers;
     }
 
     private string GetRootAdminUserId() => (_doc?.rootAdminUserId ?? "").Trim();
