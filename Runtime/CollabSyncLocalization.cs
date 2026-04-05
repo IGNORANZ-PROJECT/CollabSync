@@ -10,8 +10,8 @@ namespace Ignoranz.CollabSync
         {
             None,
             CurrentUICulture,
-            CurrentCulture,
-            ApplicationSystemLanguage
+            InstalledUICulture,
+            CurrentCulture
         }
 
         public static bool UseJapanese => GetResolvedLanguageMode() == CollabSyncLanguageMode.Japanese;
@@ -44,8 +44,17 @@ namespace Ignoranz.CollabSync
             if (source == AutoLanguageSource.CurrentUICulture)
             {
                 return F(
-                    "Current language: {0} (Auto -> OS UI culture: {1}).",
-                    "現在の言語: {0}（自動設定 -> OS UI カルチャ: {1}）。",
+                    "Current language: {0} (Auto -> PC UI culture: {1}).",
+                    "現在の言語: {0}（自動設定 -> PC の UI カルチャ: {1}）。",
+                    resolvedLabel,
+                    sourceDetail);
+            }
+
+            if (source == AutoLanguageSource.InstalledUICulture)
+            {
+                return F(
+                    "Current language: {0} (Auto -> PC installed UI culture: {1}).",
+                    "現在の言語: {0}（自動設定 -> PC の既定 UI カルチャ: {1}）。",
                     resolvedLabel,
                     sourceDetail);
             }
@@ -53,17 +62,8 @@ namespace Ignoranz.CollabSync
             if (source == AutoLanguageSource.CurrentCulture)
             {
                 return F(
-                    "Current language: {0} (Auto -> OS culture: {1}).",
-                    "現在の言語: {0}（自動設定 -> OS カルチャ: {1}）。",
-                    resolvedLabel,
-                    sourceDetail);
-            }
-
-            if (source == AutoLanguageSource.ApplicationSystemLanguage)
-            {
-                return F(
-                    "Current language: {0} (Auto -> Application.systemLanguage: {1}).",
-                    "現在の言語: {0}（自動設定 -> Application.systemLanguage: {1}）。",
+                    "Current language: {0} (Auto -> PC culture: {1}).",
+                    "現在の言語: {0}（自動設定 -> PC カルチャ: {1}）。",
                     resolvedLabel,
                     sourceDetail);
             }
@@ -107,6 +107,13 @@ namespace Ignoranz.CollabSync
                 return true;
             }
 
+            if (TryGetCultureLanguageMode(CultureInfo.InstalledUICulture, out mode))
+            {
+                source = AutoLanguageSource.InstalledUICulture;
+                sourceDetail = GetCultureSourceDetail(CultureInfo.InstalledUICulture);
+                return true;
+            }
+
             if (TryGetCultureLanguageMode(CultureInfo.CurrentCulture, out mode))
             {
                 source = AutoLanguageSource.CurrentCulture;
@@ -114,29 +121,10 @@ namespace Ignoranz.CollabSync
                 return true;
             }
 
-            if (TryGetSystemLanguageMode(out mode))
-            {
-                source = AutoLanguageSource.ApplicationSystemLanguage;
-                sourceDetail = Application.systemLanguage.ToString();
-                return true;
-            }
-
             mode = CollabSyncLanguageMode.English;
             source = AutoLanguageSource.None;
             sourceDetail = "";
             return false;
-        }
-
-        static bool TryGetSystemLanguageMode(out CollabSyncLanguageMode mode)
-        {
-            mode = CollabSyncLanguageMode.English;
-            if (Application.systemLanguage == SystemLanguage.Unknown)
-                return false;
-
-            mode = Application.systemLanguage == SystemLanguage.Japanese
-                ? CollabSyncLanguageMode.Japanese
-                : CollabSyncLanguageMode.English;
-            return true;
         }
 
         static bool TryGetCultureLanguageMode(CultureInfo culture, out CollabSyncLanguageMode mode)

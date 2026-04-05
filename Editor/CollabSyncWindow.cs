@@ -1913,8 +1913,8 @@ public class CollabSyncWindow : EditorWindow
             MessageType.None);
 
         EditorGUILayout.HelpBox(
-            L("System Default follows the OS language first, then falls back to Application.systemLanguage.",
-              "システム設定はまず OS の言語を参照し、取れない場合は Application.systemLanguage にフォールバックします。"),
+            L("System Default follows the PC UI language first, then falls back to the PC culture, and finally English.",
+              "システム設定はまず PC の UI 言語を参照し、取れない場合は PC のカルチャ、最後に英語へフォールバックします。"),
             MessageType.None);
     }
 
