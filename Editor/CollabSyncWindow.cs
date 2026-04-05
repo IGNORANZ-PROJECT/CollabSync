@@ -382,11 +382,11 @@ public class CollabSyncWindow : EditorWindow
                 {
                     var isUnread = MemoIsUnread(memo);
                     var tags = new List<string>();
-                    if (memo.pinned) tags.Add(L("Pinned", "ピン留め"));
+                    if (memo.pinned) tags.Add("📌");
                     if (isUnread) tags.Add(L("Unread", "未読"));
                     var tagText = tags.Count == 0 ? "" : "  [" + string.Join(" / ", tags) + "]";
                     GUILayout.Label($"{DisplayUser(memo.authorId, memo.author)}  {UnixToLocal(memo.createdAt)}{tagText}", _memoMetaStyle);
-                    GUILayout.Label(RenderMemoMarkdown(memo.text), _memoPreviewStyle);
+                    GUILayout.Label(RenderMemoMarkdown(memo.text), _memoBodyStyle);
 
                     if (isUnread)
                     {
@@ -1372,7 +1372,7 @@ public class CollabSyncWindow : EditorWindow
         {
             EditorGUILayout.LabelField(title, EditorStyles.boldLabel);
             if (!string.IsNullOrEmpty(latest.text))
-                EditorGUILayout.LabelField(TrimForToast(latest.text), _cardDetailStyle);
+                GUILayout.Label(RenderMemoMarkdown(latest.text), _memoPreviewStyle);
 
             DrawActionButtons(
                 new ActionButtonInfo
