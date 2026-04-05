@@ -16,7 +16,7 @@ public class AssetLockGuard : AssetModificationProcessor
         s_isProcessingSave = true;
         try
         {
-            var cfg = Resources.Load<CollabSyncConfig>("CollabSyncConfig");
+            var cfg = CollabSyncConfig.LoadOrCreate();
             if (!cfg)
                 return paths;
 

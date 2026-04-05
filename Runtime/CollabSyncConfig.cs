@@ -17,6 +17,7 @@ namespace Ignoranz.CollabSync
     public class CollabSyncConfig : ScriptableObject
     {
         const string ProjectLocalEditorAssetPath = "Assets/IGNORANZ-PROJECT/CollabSyncSettings/Resources/CollabSyncConfig.asset";
+        const string EditorPrefsLocalJsonPathKeyPrefix = "Ignoranz.CollabSync.LocalJsonPath.";
 #if UNITY_EDITOR
         static CollabSyncConfig s_cachedEditorAsset;
 #endif
@@ -51,7 +52,10 @@ namespace Ignoranz.CollabSync
         public static CollabSyncConfig LoadOrCreate()
         {
             if (s_cachedEditorAsset != null)
+            {
+                RestoreEditorLocalJsonPathPreference(s_cachedEditorAsset);
                 return s_cachedEditorAsset;
+            }
 
             var asset = FindProjectLocalEditorAsset();
             if (!asset)
@@ -66,8 +70,33 @@ namespace Ignoranz.CollabSync
                 AssetDatabase.SaveAssets();
             }
 
+            RestoreEditorLocalJsonPathPreference(asset);
             s_cachedEditorAsset = asset;
             return asset;
+        }
+
+        public static bool SetEditorLocalJsonPath(CollabSyncConfig asset, string value)
+        {
+            if (asset == null)
+                return false;
+
+            var normalized = CollabSyncBackendUtility.NormalizeStoredPathInput(value);
+            var changed = !string.Equals(asset.localJsonPath ?? "", normalized ?? "", System.StringComparison.Ordinal);
+            if (changed)
+                asset.localJsonPath = normalized;
+
+            StoreEditorLocalJsonPathPreference(normalized);
+
+            if (!changed)
+                return false;
+
+            SaveEditorAsset(asset, persistLocalJsonPath: false);
+            return true;
+        }
+
+        public static void SaveEditorAsset(CollabSyncConfig asset)
+        {
+            SaveEditorAsset(asset, persistLocalJsonPath: true);
         }
 
         static CollabSyncConfig FindProjectLocalEditorAsset()
@@ -160,6 +189,66 @@ namespace Ignoranz.CollabSync
         {
             return !string.IsNullOrEmpty(path)
                 && path.StartsWith("Packages/", System.StringComparison.Ordinal);
+        }
+
+        static void SaveEditorAsset(CollabSyncConfig asset, bool persistLocalJsonPath)
+        {
+            if (asset == null)
+                return;
+
+            if (persistLocalJsonPath)
+                StoreEditorLocalJsonPathPreference(asset.localJsonPath);
+
+            EditorUtility.SetDirty(asset);
+            AssetDatabase.SaveAssets();
+        }
+
+        static void RestoreEditorLocalJsonPathPreference(CollabSyncConfig asset)
+        {
+            if (asset == null)
+                return;
+
+            var assetValue = CollabSyncBackendUtility.NormalizeStoredPathInput(asset.localJsonPath);
+            if (!string.Equals(asset.localJsonPath ?? "", assetValue ?? "", System.StringComparison.Ordinal))
+            {
+                asset.localJsonPath = assetValue;
+                SaveEditorAsset(asset);
+                return;
+            }
+
+            var storedValue = CollabSyncBackendUtility.NormalizeStoredPathInput(
+                EditorPrefs.GetString(GetEditorLocalJsonPathPreferenceKey(), ""));
+
+            if (!string.IsNullOrEmpty(storedValue)
+                && (string.IsNullOrEmpty(assetValue)
+                    || string.Equals(assetValue, CollabSyncBackendUtility.DefaultLocalJsonPath, System.StringComparison.Ordinal))
+                && !string.Equals(assetValue, storedValue, System.StringComparison.Ordinal))
+            {
+                asset.localJsonPath = storedValue;
+                SaveEditorAsset(asset);
+                return;
+            }
+
+            StoreEditorLocalJsonPathPreference(asset.localJsonPath);
+        }
+
+        static void StoreEditorLocalJsonPathPreference(string value)
+        {
+            var normalized = CollabSyncBackendUtility.NormalizeStoredPathInput(value);
+            var key = GetEditorLocalJsonPathPreferenceKey();
+            if (string.IsNullOrEmpty(normalized))
+            {
+                EditorPrefs.DeleteKey(key);
+                return;
+            }
+
+            EditorPrefs.SetString(key, normalized);
+        }
+
+        static string GetEditorLocalJsonPathPreferenceKey()
+        {
+            var projectPath = Path.GetFullPath(Directory.GetCurrentDirectory());
+            return EditorPrefsLocalJsonPathKeyPrefix + Hash128.Compute(projectPath).ToString();
         }
 #else
         public static CollabSyncConfig LoadOrCreate()

@@ -386,7 +386,7 @@ public class CollabSyncWindow : EditorWindow
                     if (isUnread) tags.Add(L("Unread", "未読"));
                     var tagText = tags.Count == 0 ? "" : "  [" + string.Join(" / ", tags) + "]";
                     GUILayout.Label($"{DisplayUser(memo.authorId, memo.author)}  {UnixToLocal(memo.createdAt)}{tagText}", _memoMetaStyle);
-                    GUILayout.Label(TrimForToast(memo.text), _memoPreviewStyle);
+                    GUILayout.Label(RenderMemoMarkdown(memo.text), _memoPreviewStyle);
 
                     if (isUnread)
                     {
@@ -1134,7 +1134,9 @@ public class CollabSyncWindow : EditorWindow
         EditorGUILayout.Space(8);
         EditorGUILayout.LabelField(L("Shared State File", "共有状態ファイル"), EditorStyles.boldLabel);
         EditorGUILayout.LabelField(L("JSON Path", "JSON パス"));
-        _cfg.localJsonPath = EditorGUILayout.TextField(_cfg.localJsonPath);
+        var nextJsonPath = EditorGUILayout.DelayedTextField(_cfg.localJsonPath);
+        if (_cfg != null && !string.Equals(nextJsonPath, _cfg.localJsonPath, StringComparison.Ordinal))
+            ApplyJsonPathSelection(nextJsonPath);
         DrawActionButtons(
             new ActionButtonInfo
             {
@@ -1194,8 +1196,19 @@ public class CollabSyncWindow : EditorWindow
 
         EditorGUILayout.Space(10);
         EditorGUILayout.LabelField(L("Notifications", "通知"), EditorStyles.boldLabel);
-        _cfg.notifyOnNewMemo = EditorGUILayout.ToggleLeft(L("Show memo alert bar", "新しいメモを通知バー表示"), _cfg.notifyOnNewMemo);
-        _cfg.beepOnNewMemo = EditorGUILayout.ToggleLeft(L("Beep on new memo", "新しいメモでビープ音"), _cfg.beepOnNewMemo);
+        var nextNotifyOnNewMemo = EditorGUILayout.ToggleLeft(L("Show memo alert bar", "新しいメモを通知バー表示"), _cfg.notifyOnNewMemo);
+        if (_cfg != null && nextNotifyOnNewMemo != _cfg.notifyOnNewMemo)
+        {
+            _cfg.notifyOnNewMemo = nextNotifyOnNewMemo;
+            CollabSyncConfig.SaveEditorAsset(_cfg);
+        }
+
+        var nextBeepOnNewMemo = EditorGUILayout.ToggleLeft(L("Beep on new memo", "新しいメモでビープ音"), _cfg.beepOnNewMemo);
+        if (_cfg != null && nextBeepOnNewMemo != _cfg.beepOnNewMemo)
+        {
+            _cfg.beepOnNewMemo = nextBeepOnNewMemo;
+            CollabSyncConfig.SaveEditorAsset(_cfg);
+        }
 
         EditorGUILayout.Space(10);
         EditorGUILayout.LabelField(L("Doctor", "Doctor"), EditorStyles.boldLabel);
@@ -1255,9 +1268,6 @@ public class CollabSyncWindow : EditorWindow
                 EditorGUILayout.SelectableLabel(line, EditorStyles.label, GUILayout.Height(EditorGUIUtility.singleLineHeight + 2));
             EditorGUILayout.EndScrollView();
         }
-
-        if (GUI.changed)
-            EditorUtility.SetDirty(_cfg);
 
         EditorGUILayout.EndScrollView();
     }
@@ -1931,8 +1941,7 @@ public class CollabSyncWindow : EditorWindow
         if (_cfg != null && nextMode != currentMode)
         {
             _cfg.languageMode = (CollabSyncLanguageMode)Mathf.Clamp(nextMode, 0, 2);
-            EditorUtility.SetDirty(_cfg);
-            AssetDatabase.SaveAssets();
+            CollabSyncConfig.SaveEditorAsset(_cfg);
             CollabSyncLocalization.InvalidateCaches();
             Repaint();
         }
@@ -2090,9 +2099,10 @@ public class CollabSyncWindow : EditorWindow
 
     private void ApplyJsonPathSelection(string chosenPath)
     {
-        _cfg.localJsonPath = chosenPath;
-        EditorUtility.SetDirty(_cfg);
-        AssetDatabase.SaveAssets();
+        if (_cfg == null)
+            return;
+
+        CollabSyncConfig.SetEditorLocalJsonPath(_cfg, chosenPath);
         BuildBackendSafe();
         Repaint();
     }
@@ -2106,9 +2116,7 @@ public class CollabSyncWindow : EditorWindow
         if (string.IsNullOrEmpty(normalized) || string.Equals(normalized, _cfg.localJsonPath, StringComparison.Ordinal))
             return;
 
-        _cfg.localJsonPath = normalized;
-        EditorUtility.SetDirty(_cfg);
-        AssetDatabase.SaveAssets();
+        CollabSyncConfig.SetEditorLocalJsonPath(_cfg, normalized);
     }
 
     private void CopyDoctorResult()
@@ -3161,7 +3169,7 @@ public class CollabSyncWindow : EditorWindow
         _memoPreviewStyle ??= new GUIStyle(EditorStyles.wordWrappedLabel)
         {
             wordWrap = true,
-            richText = false,
+            richText = true,
             fontSize = 12
         };
     }
