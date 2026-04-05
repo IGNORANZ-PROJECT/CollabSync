@@ -16,6 +16,8 @@ namespace Ignoranz.CollabSync
     [CreateAssetMenu(fileName = "CollabSyncConfig", menuName = "IGNORANZ PROJECT/CollabSyncConfig")]
     public class CollabSyncConfig : ScriptableObject
     {
+        const string ProjectLocalEditorAssetPath = "Assets/IGNORANZ-PROJECT/CollabSyncSettings/Resources/CollabSyncConfig.asset";
+
         public string projectId = "IGNORANZ_PROJECT_DEFAULT";
 
         [Header("Shared State File")]
@@ -45,9 +47,9 @@ namespace Ignoranz.CollabSync
 #if UNITY_EDITOR
         public static CollabSyncConfig LoadOrCreate()
         {
-            var asset = Resources.Load<CollabSyncConfig>("CollabSyncConfig");
+            var asset = FindProjectLocalEditorAsset();
             if (!asset)
-                asset = FindExistingEditorAsset();
+                asset = TryCreateProjectLocalCopyFromPackagedAsset();
 
             if (!asset)
             {
@@ -60,13 +62,13 @@ namespace Ignoranz.CollabSync
             return asset;
         }
 
-        static CollabSyncConfig FindExistingEditorAsset()
+        static CollabSyncConfig FindProjectLocalEditorAsset()
         {
             var existingGuids = AssetDatabase.FindAssets("t:CollabSyncConfig CollabSyncConfig");
             foreach (var guid in existingGuids)
             {
                 var path = AssetDatabase.GUIDToAssetPath(guid);
-                if (string.IsNullOrEmpty(path))
+                if (string.IsNullOrEmpty(path) || !IsProjectLocalEditorAssetPath(path))
                     continue;
 
                 var loaded = AssetDatabase.LoadAssetAtPath<CollabSyncConfig>(path);
@@ -77,27 +79,66 @@ namespace Ignoranz.CollabSync
             return null;
         }
 
+        static CollabSyncConfig FindPackagedEditorAsset()
+        {
+            var packagedResource = Resources.Load<CollabSyncConfig>("CollabSyncConfig");
+            if (packagedResource != null)
+            {
+                var resourcePath = AssetDatabase.GetAssetPath(packagedResource);
+                if (IsPackagedAssetPath(resourcePath))
+                    return packagedResource;
+            }
+
+            var existingGuids = AssetDatabase.FindAssets("t:CollabSyncConfig CollabSyncConfig");
+            foreach (var guid in existingGuids)
+            {
+                var path = AssetDatabase.GUIDToAssetPath(guid);
+                if (string.IsNullOrEmpty(path) || !IsPackagedAssetPath(path))
+                    continue;
+
+                var loaded = AssetDatabase.LoadAssetAtPath<CollabSyncConfig>(path);
+                if (loaded != null)
+                    return loaded;
+            }
+
+            return null;
+        }
+
+        static CollabSyncConfig TryCreateProjectLocalCopyFromPackagedAsset()
+        {
+            var source = FindPackagedEditorAsset();
+            if (source == null)
+                return null;
+
+            var asset = ScriptableObject.CreateInstance<CollabSyncConfig>();
+            EditorUtility.CopySerialized(source, asset);
+
+            var assetPath = ResolveEditorAssetPath();
+            Directory.CreateDirectory(Path.GetDirectoryName(assetPath) ?? "Assets");
+            AssetDatabase.CreateAsset(asset, assetPath);
+            AssetDatabase.SaveAssets();
+            return asset;
+        }
+
         static string ResolveEditorAssetPath()
         {
-            var existingAsset = FindExistingEditorAsset();
+            var existingAsset = FindProjectLocalEditorAsset();
             if (existingAsset != null)
                 return AssetDatabase.GetAssetPath(existingAsset);
 
-            var scriptGuids = AssetDatabase.FindAssets("CollabSyncConfig t:Script");
-            foreach (var guid in scriptGuids)
-            {
-                var scriptPath = AssetDatabase.GUIDToAssetPath(guid);
-                if (string.IsNullOrEmpty(scriptPath))
-                    continue;
+            return ProjectLocalEditorAssetPath;
+        }
 
-                var runtimeDir = Path.GetDirectoryName(scriptPath);
-                if (string.IsNullOrEmpty(runtimeDir))
-                    continue;
+        static bool IsProjectLocalEditorAssetPath(string path)
+        {
+            return !string.IsNullOrEmpty(path)
+                && path.StartsWith("Assets/", System.StringComparison.Ordinal);
+        }
 
-                return Path.Combine(runtimeDir, "Resources", "CollabSyncConfig.asset").Replace('\\', '/');
-            }
-
-            return "Assets/IGNORANZ-PROJECT/CollabSync/Runtime/Resources/CollabSyncConfig.asset";
+        static bool IsPackagedAssetPath(string path)
+        {
+            return !string.IsNullOrEmpty(path)
+                && path.StartsWith("Packages/", System.StringComparison.Ordinal);
         }
 #else
         public static CollabSyncConfig LoadOrCreate()

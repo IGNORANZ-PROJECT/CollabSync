@@ -761,7 +761,7 @@ public class CollabSyncWindow : EditorWindow
                     DrawOverviewLine(L("User ID", "ユーザーID"), user.userId);
                 DrawOverviewLine(
                     L("Status", "状態"),
-                    currentPresence != null
+                    user.isOnline
                         ? L("Online", "オンライン")
                         : L("Offline", "オフライン"));
 
@@ -2280,8 +2280,28 @@ public class CollabSyncWindow : EditorWindow
     private List<EditingPresence> GetAlivePresences()
     {
         var now = TimeUtil.NowMs();
-        return (_doc?.presences ?? new List<EditingPresence>())
+        var alive = (_doc?.presences ?? new List<EditingPresence>())
             .Where(p => p != null && now - p.heartbeat < PresenceAliveWindowMs)
+            .ToList();
+
+        if (EditingTracker.TryGetLastPublishedPresence(out var localPresence)
+            && localPresence != null
+            && now - localPresence.heartbeat < PresenceAliveWindowMs
+            && IsCurrentUser(localPresence.userId, localPresence.user))
+        {
+            var existingIndex = alive.FindIndex(p => p != null && CollabIdentityUtility.Matches(localPresence.userId, localPresence.user, p.userId, p.user));
+            if (existingIndex >= 0)
+            {
+                if (alive[existingIndex].heartbeat < localPresence.heartbeat)
+                    alive[existingIndex] = localPresence;
+            }
+            else
+            {
+                alive.Add(localPresence);
+            }
+        }
+
+        return alive
             .GroupBy(p => UserKey(p.userId, p.user))
             .Select(group => group.OrderByDescending(p => p.heartbeat).First())
             .OrderBy(p => p.assetPath ?? "")
@@ -2311,6 +2331,17 @@ public class CollabSyncWindow : EditorWindow
                 return;
 
             var key = string.IsNullOrEmpty(userId) ? "legacy:" + displayName : userId;
+            if (!string.IsNullOrEmpty(userId) && !map.ContainsKey(key))
+            {
+                var legacyKey = "legacy:" + displayName;
+                if (map.TryGetValue(legacyKey, out var legacyExisting) && string.IsNullOrEmpty(legacyExisting.userId))
+                {
+                    map.Remove(legacyKey);
+                    legacyExisting.userId = userId;
+                    map[key] = legacyExisting;
+                }
+            }
+
             if (!map.TryGetValue(key, out var existing))
             {
                 existing = new KnownUserInfo

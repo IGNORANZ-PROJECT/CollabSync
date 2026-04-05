@@ -130,7 +130,11 @@ namespace Ignoranz.CollabSync
 
         static CollabSyncLanguageMode LoadConfiguredLanguageMode()
         {
+#if UNITY_EDITOR
+            var cfg = CollabSyncConfig.LoadOrCreate();
+#else
             var cfg = Resources.Load<CollabSyncConfig>("CollabSyncConfig");
+#endif
             return cfg != null ? cfg.languageMode : CollabSyncLanguageMode.Auto;
         }
 

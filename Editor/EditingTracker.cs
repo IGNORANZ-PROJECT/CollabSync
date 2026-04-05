@@ -32,6 +32,8 @@ public static class EditingTracker
     static long _lastWarnAt;
     static string _lastAutoLockKey = "";
     static string _lastGitHeadSignature = "";
+    static readonly object _lastPresenceLock = new();
+    static EditingPresence _lastPublishedPresence;
 
     static EditingTracker()
     {
@@ -175,6 +177,7 @@ public static class EditingTracker
         };
 
         await _backend.PublishPresenceAsync(p);
+        RememberLastPublishedPresence(p);
         await SyncAutoLockAsync();
 
         // 他ユーザーのソフトロック警告
@@ -200,6 +203,46 @@ public static class EditingTracker
 
         if (string.IsNullOrEmpty(warnSignature))
             _lastWarnSignature = "";
+    }
+
+    static void RememberLastPublishedPresence(EditingPresence presence)
+    {
+        if (presence == null)
+            return;
+
+        lock (_lastPresenceLock)
+        {
+            _lastPublishedPresence = new EditingPresence
+            {
+                userId = presence.userId ?? "",
+                user = presence.user ?? "",
+                assetPath = presence.assetPath ?? "",
+                context = presence.context ?? "",
+                heartbeat = presence.heartbeat
+            };
+        }
+    }
+
+    public static bool TryGetLastPublishedPresence(out EditingPresence presence)
+    {
+        lock (_lastPresenceLock)
+        {
+            if (_lastPublishedPresence == null)
+            {
+                presence = null;
+                return false;
+            }
+
+            presence = new EditingPresence
+            {
+                userId = _lastPublishedPresence.userId ?? "",
+                user = _lastPublishedPresence.user ?? "",
+                assetPath = _lastPublishedPresence.assetPath ?? "",
+                context = _lastPublishedPresence.context ?? "",
+                heartbeat = _lastPublishedPresence.heartbeat
+            };
+            return true;
+        }
     }
 
     static async Task SyncAutoLockAsync()
