@@ -439,6 +439,19 @@ Doctor で確認する内容:
 貼れます。
 `Memos` タブの `Link target` で `URL / Asset Path` を選ぶと、Web URL や Unity の Asset Path を直接紐付けできます。
 
+### Q. Package Manager 追加後に `has no meta file, but it's in an immutable folder` が出る
+
+PackageCache に古い Git パッケージ内容が残っている可能性があります。
+
+対処:
+
+1. Unity を閉じます
+2. プロジェクト内の `Library/PackageCache/com.ignoranz.collabsync@...` フォルダを削除します
+3. 必要なら `Packages/packages-lock.json` から `com.ignoranz.collabsync` を外すか、Package Manager で一度 `Remove` します
+4. もう一度 `https://github.com/IGNORANZ-PROJECT/CollabSync.git` から追加します
+
+正常に取り込めれば、CollabSync は自動で `Assets/IGNORANZ PROJECT/CollabSync/` に展開されます。
+
 ### Q. 表示名を変えたら別ユーザーになる？
 
 なりません。
