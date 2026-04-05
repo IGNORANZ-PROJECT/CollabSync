@@ -1,0 +1,14 @@
+{
+  "name": "IGNORANZ.CollabSync",
+  "rootNamespace": "Ignoranz.CollabSync",
+  "references": [],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}
