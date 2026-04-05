@@ -1884,6 +1884,13 @@ public class CollabSyncWindow : EditorWindow
     {
         EditorGUILayout.LabelField(L("Language", "言語"), EditorStyles.boldLabel);
 
+        if (CollabSyncLocalization.IsJapaneseEditorWarningActive)
+        {
+            EditorGUILayout.HelpBox(
+                CollabSyncLocalization.JapaneseEditorWorkaroundMessage,
+                MessageType.Warning);
+        }
+
         var currentMode = _cfg != null ? (int)_cfg.languageMode : 0;
         var options = new[]
         {
@@ -1897,12 +1904,17 @@ public class CollabSyncWindow : EditorWindow
         {
             _cfg.languageMode = (CollabSyncLanguageMode)Mathf.Clamp(nextMode, 0, 2);
             EditorUtility.SetDirty(_cfg);
+            AssetDatabase.SaveAssets();
             Repaint();
         }
 
         EditorGUILayout.HelpBox(
-            L("System Default follows the OS language. English is used unless the system language is Japanese.",
-              "システム設定は OS の言語に従います。システム言語が日本語でない場合は英語になります。"),
+            CollabSyncLocalization.GetLanguageStatusSummary(),
+            MessageType.None);
+
+        EditorGUILayout.HelpBox(
+            L("System Default follows the OS language first, then falls back to Application.systemLanguage.",
+              "システム設定はまず OS の言語を参照し、取れない場合は Application.systemLanguage にフォールバックします。"),
             MessageType.None);
     }
 

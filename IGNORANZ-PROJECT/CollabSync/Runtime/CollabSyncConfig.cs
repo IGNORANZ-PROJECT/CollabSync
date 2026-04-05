@@ -47,6 +47,9 @@ namespace Ignoranz.CollabSync
         {
             var asset = Resources.Load<CollabSyncConfig>("CollabSyncConfig");
             if (!asset)
+                asset = FindExistingEditorAsset();
+
+            if (!asset)
             {
                 asset = ScriptableObject.CreateInstance<CollabSyncConfig>();
                 var assetPath = ResolveEditorAssetPath();
@@ -57,7 +60,7 @@ namespace Ignoranz.CollabSync
             return asset;
         }
 
-        static string ResolveEditorAssetPath()
+        static CollabSyncConfig FindExistingEditorAsset()
         {
             var existingGuids = AssetDatabase.FindAssets("t:CollabSyncConfig CollabSyncConfig");
             foreach (var guid in existingGuids)
@@ -68,8 +71,17 @@ namespace Ignoranz.CollabSync
 
                 var loaded = AssetDatabase.LoadAssetAtPath<CollabSyncConfig>(path);
                 if (loaded != null)
-                    return path;
+                    return loaded;
             }
+
+            return null;
+        }
+
+        static string ResolveEditorAssetPath()
+        {
+            var existingAsset = FindExistingEditorAsset();
+            if (existingAsset != null)
+                return AssetDatabase.GetAssetPath(existingAsset);
 
             var scriptGuids = AssetDatabase.FindAssets("CollabSyncConfig t:Script");
             foreach (var guid in scriptGuids)
