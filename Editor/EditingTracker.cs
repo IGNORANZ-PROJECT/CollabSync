@@ -70,6 +70,8 @@ public static class EditingTracker
             CollabSyncBackendUtility.ClearLoggedError("EditingTracker");
             _lastGitHeadSignature = ReadGitHeadSignature();
             _initialized = true;
+
+            _ = SafeSendBeat(_currentAssetPath, _currentContext);
         }
         catch (Exception e)
         {
@@ -93,10 +95,8 @@ public static class EditingTracker
             {
                 SafeDetectAll("heartbeat");
 
-                if (!string.IsNullOrEmpty(_currentAssetPath) && _backend != null)
+                if (_backend != null)
                     _ = SafeSendBeat(_currentAssetPath, _currentContext);
-                else if (_backend != null)
-                    _ = SafeSyncAutoLock();
 
                 _nextBeatAt = EditorApplication.timeSinceStartup + HEARTBEAT_SEC;
             }
@@ -140,12 +140,7 @@ public static class EditingTracker
         _shouldAutoLock   = shouldAutoLock;
 
         if (_backend != null)
-        {
-            if (!string.IsNullOrEmpty(_currentAssetPath))
-                _ = SafeSendBeat(_currentAssetPath, _currentContext);
-            else
-                _ = SafeSyncAutoLock();
-        }
+            _ = SafeSendBeat(_currentAssetPath, _currentContext);
 
         _nextBeatAt = EditorApplication.timeSinceStartup + HEARTBEAT_SEC;
     }

@@ -6,6 +6,8 @@ using UnityEngine;
 using System;
 using System.IO;
 using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Collections.Generic;
 using Ignoranz.CollabSync;
@@ -105,6 +107,16 @@ public class CollabSyncWindow : EditorWindow
     private GUIStyle _cardValueStyle;
     private GUIStyle _cardValueButtonStyle;
     private GUIStyle _cardDetailStyle;
+    private GUIStyle _memoMetaStyle;
+    private GUIStyle _memoBodyStyle;
+    private GUIStyle _memoPreviewStyle;
+
+    private const long PresenceAliveWindowMs = 20_000;
+    private static readonly Regex MemoMarkdownFenceRegex = new(@"```(?:[^\n`]*)\n?([\s\S]*?)```", RegexOptions.Compiled);
+    private static readonly Regex MemoMarkdownInlineCodeRegex = new(@"`([^`\n]+)`", RegexOptions.Compiled);
+    private static readonly Regex MemoMarkdownLinkRegex = new(@"\[([^\]]+)\]\(([^)]+)\)", RegexOptions.Compiled);
+    private static readonly Regex MemoMarkdownBoldRegex = new(@"(\*\*|__)(.+?)\1", RegexOptions.Compiled);
+    private static readonly Regex MemoMarkdownItalicRegex = new(@"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)|(?<!_)_(?!\s)(.+?)(?<!\s)_(?!_)", RegexOptions.Compiled);
 
     [MenuItem("Tools/CollabSync", priority = 20)]
     public static void Open()
@@ -360,8 +372,8 @@ public class CollabSyncWindow : EditorWindow
                     if (memo.pinned) tags.Add(L("Pinned", "ピン留め"));
                     if (isUnread) tags.Add(L("Unread", "未読"));
                     var tagText = tags.Count == 0 ? "" : "  [" + string.Join(" / ", tags) + "]";
-                    EditorGUILayout.LabelField($"{DisplayUser(memo.authorId, memo.author)}  {UnixToLocal(memo.createdAt)}{tagText}", EditorStyles.boldLabel);
-                    EditorGUILayout.LabelField(TrimForToast(memo.text), _cardDetailStyle);
+                    GUILayout.Label($"{DisplayUser(memo.authorId, memo.author)}  {UnixToLocal(memo.createdAt)}{tagText}", _memoMetaStyle);
+                    GUILayout.Label(TrimForToast(memo.text), _memoPreviewStyle);
 
                     if (isUnread)
                     {
@@ -1025,17 +1037,17 @@ public class CollabSyncWindow : EditorWindow
                         _ = _backend.UpsertMemoAsync(memo);
                     }
 
-                    GUILayout.Label($"{DisplayUser(memo.authorId, memo.author)}  {UnixToLocal(memo.createdAt)}");
+                    GUILayout.Label($"{DisplayUser(memo.authorId, memo.author)}  {UnixToLocal(memo.createdAt)}", _memoMetaStyle);
                     GUILayout.FlexibleSpace();
 
                     if (!string.IsNullOrEmpty(memo.assetPath))
-                        GUILayout.Label(L("[Linked]", "[関連]"), EditorStyles.miniBoldLabel);
+                        GUILayout.Label(L("[Linked]", "[関連]"), _memoMetaStyle);
                 }
 
                 if (!string.IsNullOrEmpty(memo.assetPath))
                     EditorGUILayout.LabelField(L("Linked to", "紐付け先"), memo.assetPath, _cardDetailStyle);
 
-                EditorGUILayout.LabelField(memo.text ?? "", EditorStyles.wordWrappedLabel);
+                GUILayout.Label(RenderMemoMarkdown(memo.text), _memoBodyStyle);
                 EditorGUILayout.Space(3);
 
                 var isAdmin = IsCurrentUserAdmin();
@@ -1044,7 +1056,7 @@ public class CollabSyncWindow : EditorWindow
                 var readers = GetMemoReaderDisplayNames(memo);
                 var meRead = CollabIdentityUtility.HasRead(memo, CurrentUserId, CurrentUserName);
 
-                GUILayout.Label(L("Read by: ", "既読: ") + (readers.Length == 0 ? L("none", "なし") : string.Join(", ", readers)));
+                GUILayout.Label(L("Read by: ", "既読: ") + (readers.Length == 0 ? L("none", "なし") : string.Join(", ", readers)), _memoMetaStyle);
                 DrawActionButtons(
                     new ActionButtonInfo
                     {
@@ -1913,8 +1925,8 @@ public class CollabSyncWindow : EditorWindow
             MessageType.None);
 
         EditorGUILayout.HelpBox(
-            L("System Default follows the PC UI language first, then falls back to the PC culture, and finally English.",
-              "システム設定はまず PC の UI 言語を参照し、取れない場合は PC のカルチャ、最後に英語へフォールバックします。"),
+            L("System Default follows the OS language settings, without using Unity's Application.systemLanguage.",
+              "システム設定は Unity の Application.systemLanguage を使わず、OS の言語設定を優先して判定します。"),
             MessageType.None);
     }
 
@@ -2269,7 +2281,7 @@ public class CollabSyncWindow : EditorWindow
     {
         var now = TimeUtil.NowMs();
         return (_doc?.presences ?? new List<EditingPresence>())
-            .Where(p => p != null && now - p.heartbeat < 10000)
+            .Where(p => p != null && now - p.heartbeat < PresenceAliveWindowMs)
             .GroupBy(p => UserKey(p.userId, p.user))
             .Select(group => group.OrderByDescending(p => p.heartbeat).First())
             .OrderBy(p => p.assetPath ?? "")
@@ -2834,7 +2846,12 @@ public class CollabSyncWindow : EditorWindow
             return "";
 
         if (string.IsNullOrEmpty(presence.assetPath))
-            return presence.context ?? "";
+        {
+            if (!string.IsNullOrEmpty(presence.context))
+                return presence.context;
+
+            return L("Online (no active target)", "オンライン中（作業対象なし）");
+        }
 
         return $"{presence.context} / {TruncateMiddle(presence.assetPath, IsCompactLayout(620f) ? 40 : 72)}";
     }
@@ -2980,7 +2997,9 @@ public class CollabSyncWindow : EditorWindow
     private static string TrimForToast(string s)
     {
         if (string.IsNullOrEmpty(s)) return "";
+        s = StripMemoMarkdownToPlainText(s);
         s = s.Replace("\r", " ").Replace("\n", " ");
+        s = Regex.Replace(s, @"\s+", " ").Trim();
         return s.Length > 60 ? s[..60] + "…" : s;
     }
 
@@ -3005,6 +3024,164 @@ public class CollabSyncWindow : EditorWindow
         {
             wordWrap = true
         };
+        _memoMetaStyle ??= new GUIStyle(EditorStyles.miniLabel)
+        {
+            wordWrap = true,
+            richText = false,
+            fontSize = 10
+        };
+        _memoBodyStyle ??= new GUIStyle(EditorStyles.wordWrappedLabel)
+        {
+            wordWrap = true,
+            richText = true,
+            fontSize = 13
+        };
+        _memoPreviewStyle ??= new GUIStyle(EditorStyles.wordWrappedLabel)
+        {
+            wordWrap = true,
+            richText = false,
+            fontSize = 12
+        };
+    }
+
+    private static string RenderMemoMarkdown(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return "";
+
+        var normalized = text.Replace("\r\n", "\n").Replace('\r', '\n');
+        var protectedTokens = new List<string>();
+        normalized = ProtectMarkdownTokens(normalized, MemoMarkdownFenceRegex, protectedTokens, FormatCodeBlockToken);
+        normalized = ProtectMarkdownTokens(normalized, MemoMarkdownInlineCodeRegex, protectedTokens, FormatInlineCodeToken);
+        normalized = ProtectMarkdownTokens(normalized, MemoMarkdownLinkRegex, protectedTokens, FormatLinkToken);
+
+        normalized = EscapeRichText(normalized);
+
+        var lines = normalized.Split('\n');
+        for (int i = 0; i < lines.Length; i++)
+            lines[i] = RenderMarkdownLine(lines[i]);
+
+        var rendered = string.Join("\n", lines);
+        rendered = MemoMarkdownBoldRegex.Replace(rendered, match => "<b>" + match.Groups[2].Value + "</b>");
+        rendered = MemoMarkdownItalicRegex.Replace(rendered, match =>
+        {
+            var content = match.Groups[1].Success ? match.Groups[1].Value : match.Groups[2].Value;
+            return "<i>" + content + "</i>";
+        });
+
+        for (int i = 0; i < protectedTokens.Count; i++)
+            rendered = rendered.Replace(CreateMarkdownToken(i), protectedTokens[i]);
+
+        return rendered;
+    }
+
+    private static string RenderMarkdownLine(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+            return "";
+
+        var trimmed = line.TrimStart();
+        if (trimmed.StartsWith("###### ", StringComparison.Ordinal)
+            || trimmed.StartsWith("##### ", StringComparison.Ordinal)
+            || trimmed.StartsWith("#### ", StringComparison.Ordinal)
+            || trimmed.StartsWith("### ", StringComparison.Ordinal)
+            || trimmed.StartsWith("## ", StringComparison.Ordinal)
+            || trimmed.StartsWith("# ", StringComparison.Ordinal))
+        {
+            var headingText = trimmed.TrimStart('#').TrimStart();
+            return "<b>" + headingText + "</b>";
+        }
+
+        if (trimmed.StartsWith("> ", StringComparison.Ordinal))
+            return "<color=#666666><i>| " + trimmed[2..] + "</i></color>";
+
+        var bulletMatch = Regex.Match(trimmed, @"^[-*+]\s+");
+        if (bulletMatch.Success)
+            return "• " + trimmed[bulletMatch.Length..];
+
+        var orderedMatch = Regex.Match(trimmed, @"^(\d+)\.\s+");
+        if (orderedMatch.Success)
+            return orderedMatch.Groups[1].Value + ". " + trimmed[orderedMatch.Length..];
+
+        return line;
+    }
+
+    private static string ProtectMarkdownTokens(string text, Regex regex, List<string> protectedTokens, Func<Match, string> formatter)
+    {
+        return regex.Replace(text, match =>
+        {
+            var token = CreateMarkdownToken(protectedTokens.Count);
+            protectedTokens.Add(formatter(match));
+            return token;
+        });
+    }
+
+    private static string CreateMarkdownToken(int index)
+    {
+        return "\uE000" + index + "\uE001";
+    }
+
+    private static string FormatCodeBlockToken(Match match)
+    {
+        var blockText = EscapeRichText((match.Groups[1].Value ?? "").Trim('\n'));
+        return "<color=#7A4B00>" + blockText.Replace("\n", "\n") + "</color>";
+    }
+
+    private static string FormatInlineCodeToken(Match match)
+    {
+        return "<color=#7A4B00><b>" + EscapeRichText(match.Groups[1].Value) + "</b></color>";
+    }
+
+    private static string FormatLinkToken(Match match)
+    {
+        var label = EscapeRichText(match.Groups[1].Value);
+        return "<color=#2F6DB5><u>" + label + "</u></color>";
+    }
+
+    private static string StripMemoMarkdownToPlainText(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return "";
+
+        var normalized = text.Replace("\r\n", "\n").Replace('\r', '\n');
+        normalized = MemoMarkdownFenceRegex.Replace(normalized, match => match.Groups[1].Value.Trim('\n'));
+        normalized = MemoMarkdownLinkRegex.Replace(normalized, match => match.Groups[1].Value);
+        normalized = MemoMarkdownInlineCodeRegex.Replace(normalized, match => match.Groups[1].Value);
+        normalized = Regex.Replace(normalized, @"^\s{0,3}#{1,6}\s*", "", RegexOptions.Multiline);
+        normalized = Regex.Replace(normalized, @"^\s{0,3}>\s?", "", RegexOptions.Multiline);
+        normalized = Regex.Replace(normalized, @"^\s{0,3}[-*+]\s+", "• ", RegexOptions.Multiline);
+        normalized = Regex.Replace(normalized, @"^\s{0,3}(\d+)\.\s+", "$1. ", RegexOptions.Multiline);
+        normalized = normalized.Replace("**", "").Replace("__", "").Replace("`", "");
+        normalized = Regex.Replace(normalized, @"(?<!\*)\*(?!\*)", "");
+        normalized = Regex.Replace(normalized, @"(?<!_)_(?!_)", "");
+        return normalized.Trim();
+    }
+
+    private static string EscapeRichText(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return "";
+
+        var builder = new StringBuilder(text.Length + 16);
+        foreach (var ch in text)
+        {
+            switch (ch)
+            {
+                case '<':
+                    builder.Append("&lt;");
+                    break;
+                case '>':
+                    builder.Append("&gt;");
+                    break;
+                case '&':
+                    builder.Append("&amp;");
+                    break;
+                default:
+                    builder.Append(ch);
+                    break;
+            }
+        }
+        return builder.ToString();
     }
 
     private static string L(string english, string japanese)

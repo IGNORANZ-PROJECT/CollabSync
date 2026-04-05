@@ -1,5 +1,8 @@
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
+using System.Text.RegularExpressions;
 using UnityEngine;
 
 namespace Ignoranz.CollabSync
@@ -9,10 +12,32 @@ namespace Ignoranz.CollabSync
         enum AutoLanguageSource
         {
             None,
+            MacUserDefaults,
+            EnvironmentVariable,
             CurrentUICulture,
             InstalledUICulture,
             CurrentCulture
         }
+
+        readonly struct AutoLanguageResolution
+        {
+            public readonly CollabSyncLanguageMode mode;
+            public readonly AutoLanguageSource source;
+            public readonly string detail;
+
+            public AutoLanguageResolution(CollabSyncLanguageMode mode, AutoLanguageSource source, string detail)
+            {
+                this.mode = mode;
+                this.source = source;
+                this.detail = detail ?? "";
+            }
+        }
+
+        static readonly object s_autoLanguageLock = new();
+        static readonly TimeSpan s_autoLanguageCacheDuration = TimeSpan.FromSeconds(10);
+        static AutoLanguageResolution s_cachedAutoLanguage;
+        static DateTime s_autoLanguageCachedAtUtc;
+        static bool s_hasAutoLanguageCache;
 
         public static bool UseJapanese => GetResolvedLanguageMode() == CollabSyncLanguageMode.Japanese;
         public static CollabSyncLanguageMode CurrentLanguageMode => GetResolvedLanguageMode();
@@ -40,6 +65,24 @@ namespace Ignoranz.CollabSync
 
             ResolveAutoLanguage(out _, out var source, out var sourceDetail);
             var resolvedLabel = DescribeMode(resolvedMode);
+
+            if (source == AutoLanguageSource.MacUserDefaults)
+            {
+                return F(
+                    "Current language: {0} (Auto -> macOS preferred language: {1}).",
+                    "現在の言語: {0}（自動設定 -> macOS の優先言語: {1}）。",
+                    resolvedLabel,
+                    sourceDetail);
+            }
+
+            if (source == AutoLanguageSource.EnvironmentVariable)
+            {
+                return F(
+                    "Current language: {0} (Auto -> environment locale: {1}).",
+                    "現在の言語: {0}（自動設定 -> 環境ロケール: {1}）。",
+                    resolvedLabel,
+                    sourceDetail);
+            }
 
             if (source == AutoLanguageSource.CurrentUICulture)
             {
@@ -100,31 +143,46 @@ namespace Ignoranz.CollabSync
 
         static bool ResolveAutoLanguage(out CollabSyncLanguageMode mode, out AutoLanguageSource source, out string sourceDetail)
         {
-            if (TryGetCultureLanguageMode(CultureInfo.CurrentUICulture, out mode))
-            {
-                source = AutoLanguageSource.CurrentUICulture;
-                sourceDetail = GetCultureSourceDetail(CultureInfo.CurrentUICulture);
-                return true;
-            }
+            var resolution = GetCachedAutoLanguageResolution();
+            mode = resolution.mode;
+            source = resolution.source;
+            sourceDetail = resolution.detail;
+            return source != AutoLanguageSource.None;
+        }
 
-            if (TryGetCultureLanguageMode(CultureInfo.InstalledUICulture, out mode))
+        static AutoLanguageResolution GetCachedAutoLanguageResolution()
+        {
+            lock (s_autoLanguageLock)
             {
-                source = AutoLanguageSource.InstalledUICulture;
-                sourceDetail = GetCultureSourceDetail(CultureInfo.InstalledUICulture);
-                return true;
-            }
+                var now = DateTime.UtcNow;
+                if (s_hasAutoLanguageCache && now - s_autoLanguageCachedAtUtc <= s_autoLanguageCacheDuration)
+                    return s_cachedAutoLanguage;
 
-            if (TryGetCultureLanguageMode(CultureInfo.CurrentCulture, out mode))
-            {
-                source = AutoLanguageSource.CurrentCulture;
-                sourceDetail = GetCultureSourceDetail(CultureInfo.CurrentCulture);
-                return true;
+                s_cachedAutoLanguage = DetectAutoLanguageResolution();
+                s_autoLanguageCachedAtUtc = now;
+                s_hasAutoLanguageCache = true;
+                return s_cachedAutoLanguage;
             }
+        }
 
-            mode = CollabSyncLanguageMode.English;
-            source = AutoLanguageSource.None;
-            sourceDetail = "";
-            return false;
+        static AutoLanguageResolution DetectAutoLanguageResolution()
+        {
+            if (TryGetMacPreferredLanguageMode(out var macMode, out var macDetail))
+                return new AutoLanguageResolution(macMode, AutoLanguageSource.MacUserDefaults, macDetail);
+
+            if (TryGetEnvironmentLanguageMode(out var environmentMode, out var environmentDetail))
+                return new AutoLanguageResolution(environmentMode, AutoLanguageSource.EnvironmentVariable, environmentDetail);
+
+            if (TryGetCultureLanguageMode(CultureInfo.CurrentUICulture, out var currentUiMode))
+                return new AutoLanguageResolution(currentUiMode, AutoLanguageSource.CurrentUICulture, GetCultureSourceDetail(CultureInfo.CurrentUICulture));
+
+            if (TryGetCultureLanguageMode(CultureInfo.InstalledUICulture, out var installedUiMode))
+                return new AutoLanguageResolution(installedUiMode, AutoLanguageSource.InstalledUICulture, GetCultureSourceDetail(CultureInfo.InstalledUICulture));
+
+            if (TryGetCultureLanguageMode(CultureInfo.CurrentCulture, out var currentCultureMode))
+                return new AutoLanguageResolution(currentCultureMode, AutoLanguageSource.CurrentCulture, GetCultureSourceDetail(CultureInfo.CurrentCulture));
+
+            return new AutoLanguageResolution(CollabSyncLanguageMode.English, AutoLanguageSource.None, "");
         }
 
         static bool TryGetCultureLanguageMode(CultureInfo culture, out CollabSyncLanguageMode mode)
@@ -151,6 +209,172 @@ namespace Ignoranz.CollabSync
             return !string.IsNullOrEmpty(culture.Name)
                 ? culture.Name
                 : culture.TwoLetterISOLanguageName;
+        }
+
+        static bool TryGetEnvironmentLanguageMode(out CollabSyncLanguageMode mode, out string detail)
+        {
+            foreach (var variableName in new[] { "LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG" })
+            {
+                var value = Environment.GetEnvironmentVariable(variableName);
+                if (!TryParseLanguageSetting(value, out mode, out detail))
+                    continue;
+
+                detail = variableName + "=" + detail;
+                return true;
+            }
+
+            mode = CollabSyncLanguageMode.English;
+            detail = "";
+            return false;
+        }
+
+        static bool TryGetMacPreferredLanguageMode(out CollabSyncLanguageMode mode, out string detail)
+        {
+            if (Application.platform != RuntimePlatform.OSXEditor && Application.platform != RuntimePlatform.OSXPlayer)
+            {
+                mode = CollabSyncLanguageMode.English;
+                detail = "";
+                return false;
+            }
+
+            if (TryReadProcessOutput("/usr/bin/defaults", "read -g AppleLanguages", out var languagesOutput)
+                && TryExtractMacLanguageToken(languagesOutput, out var languageToken)
+                && TryParseLanguageSetting(languageToken, out mode, out detail))
+            {
+                return true;
+            }
+
+            if (TryReadProcessOutput("/usr/bin/defaults", "read -g AppleLocale", out var localeOutput)
+                && TryParseLanguageSetting(localeOutput, out mode, out detail))
+            {
+                return true;
+            }
+
+            mode = CollabSyncLanguageMode.English;
+            detail = "";
+            return false;
+        }
+
+        static bool TryReadProcessOutput(string fileName, string arguments, out string output)
+        {
+            output = "";
+            try
+            {
+                using var process = new Process
+                {
+                    StartInfo = new ProcessStartInfo
+                    {
+                        FileName = fileName,
+                        Arguments = arguments,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    }
+                };
+
+                if (!process.Start())
+                    return false;
+
+                output = process.StandardOutput.ReadToEnd().Trim();
+                process.WaitForExit(1000);
+                if (!process.HasExited)
+                {
+                    try { process.Kill(); }
+                    catch { }
+                    return false;
+                }
+
+                return process.ExitCode == 0 && !string.IsNullOrWhiteSpace(output);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        static bool TryExtractMacLanguageToken(string output, out string token)
+        {
+            token = "";
+            if (string.IsNullOrWhiteSpace(output))
+                return false;
+
+            var match = Regex.Match(output, "\"([^\"]+)\"");
+            if (match.Success)
+            {
+                token = match.Groups[1].Value;
+                return true;
+            }
+
+            return TryParseLanguageSetting(output, out _, out token);
+        }
+
+        static bool TryParseLanguageSetting(string value, out CollabSyncLanguageMode mode, out string detail)
+        {
+            mode = CollabSyncLanguageMode.English;
+            detail = "";
+
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            foreach (var token in SplitLanguageSetting(value))
+            {
+                if (TryMapLanguageToken(token, out mode))
+                {
+                    detail = token;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        static IEnumerable<string> SplitLanguageSetting(string value)
+        {
+            var trimmed = value.Trim();
+            if (string.IsNullOrEmpty(trimmed))
+                yield break;
+
+            var parts = trimmed
+                .Split(new[] { '\n', '\r', ',', ';', ':' }, StringSplitOptions.RemoveEmptyEntries);
+
+            foreach (var part in parts)
+            {
+                var token = part.Trim().Trim('"', '(', ')');
+                if (string.IsNullOrEmpty(token))
+                    continue;
+                if (string.Equals(token, "C", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(token, "C.UTF-8", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(token, "POSIX", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                yield return token;
+            }
+        }
+
+        static bool TryMapLanguageToken(string token, out CollabSyncLanguageMode mode)
+        {
+            mode = CollabSyncLanguageMode.English;
+            if (string.IsNullOrWhiteSpace(token))
+                return false;
+
+            var normalized = token.Trim();
+            var separatorIndex = normalized.IndexOfAny(new[] { '.', '@' });
+            if (separatorIndex >= 0)
+                normalized = normalized.Substring(0, separatorIndex);
+
+            normalized = normalized.Replace('_', '-');
+            if (normalized.Length < 2)
+                return false;
+
+            var languageCode = normalized.Substring(0, 2);
+            if (!Regex.IsMatch(languageCode, "^[A-Za-z]{2}$"))
+                return false;
+
+            mode = string.Equals(languageCode, "ja", StringComparison.OrdinalIgnoreCase)
+                ? CollabSyncLanguageMode.Japanese
+                : CollabSyncLanguageMode.English;
+            return true;
         }
 
         static string DescribeMode(CollabSyncLanguageMode mode)
