@@ -34,10 +34,10 @@ public static class CollabSyncPackageInstaller
         if (s_removeRequest != null || SessionState.GetBool(SessionKey, false))
             return;
 
-        var packageInfo = PackageInfo.FindForAssembly(typeof(CollabSyncPackageInstaller).Assembly);
+        var packageInfo = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(CollabSyncPackageInstaller).Assembly);
         if (packageInfo == null || !string.Equals(packageInfo.name, PackageName, StringComparison.Ordinal))
             return;
-        if (packageInfo.source != PackageSource.Git)
+        if (packageInfo.source != UnityEditor.PackageManager.PackageSource.Git)
             return;
         if (string.IsNullOrEmpty(packageInfo.resolvedPath) || !Directory.Exists(packageInfo.resolvedPath))
             return;
