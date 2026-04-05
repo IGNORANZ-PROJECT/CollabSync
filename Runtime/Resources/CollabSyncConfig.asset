@@ -1,0 +1,21 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 83292598cfb2f4ae1ba5402dcbfa759f, type: 3}
+  m_Name: CollabSyncConfig
+  m_EditorClassIdentifier: 
+  projectId: CollabSync-HoloBoard
+  localJsonPath: "/Users/arata/Library/CloudStorage/OneDrive-\u500B\u4EBA\u7528/\u30C8\u3099\u30AD\u30E5\u30E1\u30F3\u30C8/IGNORANZ
+    PROJECT/\u5171\u6709\u30D5\u30A1\u30A4\u30EB/CollabSync/CollabSyncLocal.json"
+  notifyOnNewMemo: 1
+  beepOnNewMemo: 1
+  languageMode: 0
+  userDisplayName: MacDog Pra
