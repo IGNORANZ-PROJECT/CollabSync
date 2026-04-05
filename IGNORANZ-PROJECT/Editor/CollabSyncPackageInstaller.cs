@@ -11,7 +11,8 @@ using UnityEngine;
 public static class CollabSyncPackageInstaller
 {
     const string PackageName = "com.ignoranz.collabsync";
-    const string InstallAssetPath = "Assets/IGNORANZ PROJECT/CollabSync";
+    const string PackageContentFolderName = "IGNORANZ-PROJECT";
+    const string InstallAssetPath = "Assets/IGNORANZ-PROJECT";
     const string SessionKey = "CollabSync.PackageInstaller.Running";
 
     static readonly List<string> s_copiedTopLevelPaths = new();
@@ -68,9 +69,13 @@ public static class CollabSyncPackageInstaller
         if (string.IsNullOrEmpty(projectRoot))
             throw new InvalidOperationException("Project root could not be resolved.");
 
-        var installRoot = Path.Combine(projectRoot, "Assets", "IGNORANZ PROJECT", "CollabSync");
-        CopyTopLevelFolderIfNeeded(Path.Combine(packageRoot, "Editor"), Path.Combine(installRoot, "Editor"));
-        CopyTopLevelFolderIfNeeded(Path.Combine(packageRoot, "Runtime"), Path.Combine(installRoot, "Runtime"));
+        var packageContentRoot = Path.Combine(packageRoot, PackageContentFolderName);
+        if (!Directory.Exists(packageContentRoot))
+            throw new DirectoryNotFoundException("Package content folder was not found: " + packageContentRoot);
+
+        var installRoot = Path.Combine(projectRoot, "Assets", PackageContentFolderName);
+        CopyTopLevelFolderIfNeeded(Path.Combine(packageContentRoot, "Editor"), Path.Combine(installRoot, "Editor"));
+        CopyTopLevelFolderIfNeeded(Path.Combine(packageContentRoot, "Runtime"), Path.Combine(installRoot, "Runtime"));
     }
 
     static void CopyTopLevelFolderIfNeeded(string sourcePath, string destinationPath)

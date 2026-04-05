@@ -9,7 +9,7 @@ namespace Ignoranz.CollabSync
         Japanese = 2
     }
 
-    [CreateAssetMenu(fileName = "CollabSyncConfig", menuName = "IGNORANZ PROJECT/CollabSyncConfig")]
+    [CreateAssetMenu(fileName = "CollabSyncConfig", menuName = "IGNORANZ-PROJECT/CollabSyncConfig")]
     public class CollabSyncConfig : ScriptableObject
     {
         public string projectId = "IGNORANZ_PROJECT_DEFAULT";
@@ -41,12 +41,12 @@ namespace Ignoranz.CollabSync
 #if UNITY_EDITOR
         public static CollabSyncConfig LoadOrCreate()
         {
-            const string ProjectAssetPath = "Assets/IGNORANZ PROJECT/CollabSync/Runtime/Resources/CollabSyncConfig.asset";
+            const string ProjectAssetPath = "Assets/IGNORANZ-PROJECT/Runtime/Resources/CollabSyncConfig.asset";
             var asset = UnityEditor.AssetDatabase.LoadAssetAtPath<CollabSyncConfig>(ProjectAssetPath);
             if (!asset)
             {
                 asset = ScriptableObject.CreateInstance<CollabSyncConfig>();
-                System.IO.Directory.CreateDirectory("Assets/IGNORANZ PROJECT/CollabSync/Runtime/Resources");
+                System.IO.Directory.CreateDirectory("Assets/IGNORANZ-PROJECT/Runtime/Resources");
                 UnityEditor.AssetDatabase.CreateAsset(asset, ProjectAssetPath);
                 UnityEditor.AssetDatabase.SaveAssets();
             }
