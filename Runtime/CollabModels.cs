@@ -37,6 +37,11 @@ namespace Ignoranz.CollabSync
         public string reason;
         public long   createdAt;  // Unix ms
         public long   ttlMs;      // 0=無期限
+        public string state;      // "" / "retained"
+        public long   retainedAt; // Unix ms
+        public string gitBranch;
+        public string gitHeadCommit;
+        public string gitProtectedBranch;
     }
 
     [Serializable]

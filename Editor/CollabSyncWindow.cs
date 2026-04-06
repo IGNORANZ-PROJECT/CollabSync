@@ -34,8 +34,16 @@ public class CollabSyncWindow : EditorWindow
     private sealed class ActionButtonInfo
     {
         public string label = "";
+        public string tooltip = "";
         public bool enabled = true;
         public Action onClick;
+    }
+
+    private enum LockReleaseOutcome
+    {
+        None = 0,
+        Released = 1,
+        Retained = 2
     }
 
     private sealed class SelectionTargetInfo
@@ -442,15 +450,25 @@ public class CollabSyncWindow : EditorWindow
                 {
                     EditorGUILayout.LabelField(FormatLockTargetLabel(lockItem.assetPath), EditorStyles.boldLabel);
                     DrawOverviewLine(L("Owner", "所有者"), DisplayUser(lockItem.ownerId, lockItem.owner) ?? L("(unknown)", "(不明)"));
+                    DrawOverviewLine(L("State", "状態"), FormatLockState(lockItem), GetLockStateTooltip(lockItem));
+                    var gitSummary = FormatLockGitSummary(lockItem);
+                    if (!string.IsNullOrEmpty(gitSummary))
+                        DrawOverviewLine(L("Git", "Git"), gitSummary, GetLockGitTooltip(lockItem));
                     if (!string.IsNullOrEmpty(lockItem.reason))
                         DrawOverviewLine(L("Reason", "理由"), FormatLockReason(lockItem.reason));
+                    if (lockItem.retainedAt > 0)
+                        DrawOverviewLine(L("Retained Since", "保持開始"), UnixToLocal(lockItem.retainedAt), GetLockStateTooltip(lockItem));
 
                     var isMine = IsCurrentUser(lockItem);
+                    var primaryLabel = GetLockPrimaryActionLabel(lockItem, isMine);
+                    var primaryTooltip = GetLockPrimaryActionTooltip(lockItem, isMine);
+                    var canUsePrimaryAction = CanUseLockPrimaryAction(lockItem, isMine);
                     DrawActionButtons(
                         new ActionButtonInfo
                         {
-                            label = isMine ? L("Unlock", "解除") : L("Request Unlock", "解除申請"),
-                            enabled = _backend != null,
+                            label = primaryLabel,
+                            tooltip = primaryTooltip,
+                            enabled = _backend != null && canUsePrimaryAction,
                             onClick = () =>
                             {
                                 if (isMine)
@@ -888,26 +906,41 @@ public class CollabSyncWindow : EditorWindow
             {
                 EditorGUILayout.LabelField(TruncateMiddle(lockItem.assetPath ?? L("(unknown)", "(不明)"), 72), EditorStyles.boldLabel);
                 EditorGUILayout.LabelField(L("Owner", "所有者"), DisplayUser(lockItem.ownerId, lockItem.owner) ?? L("(unknown)", "(不明)"));
+                DrawDetailLine(L("State", "状態"), FormatLockState(lockItem), GetLockStateTooltip(lockItem));
+                var gitSummary = FormatLockGitSummary(lockItem);
+                if (!string.IsNullOrEmpty(gitSummary))
+                    DrawDetailLine(L("Git", "Git"), gitSummary, GetLockGitTooltip(lockItem));
                 if (!string.IsNullOrEmpty(lockItem.reason))
                     EditorGUILayout.LabelField(L("Reason", "理由"), FormatLockReason(lockItem.reason));
                 EditorGUILayout.LabelField(L("Expires", "期限"), FormatLockExpiry(lockItem));
+                if (lockItem.retainedAt > 0)
+                    DrawDetailLine(L("Retained Since", "保持開始"), UnixToLocal(lockItem.retainedAt), GetLockStateTooltip(lockItem));
+
+                var retainedDetail = FormatRetainedLockDetail(lockItem);
+                if (!string.IsNullOrEmpty(retainedDetail))
+                    EditorGUILayout.HelpBox(retainedDetail, MessageType.Info);
 
                 if (selection.HasTarget && DoesLockAffectSelection(lockItem, selection))
                     EditorGUILayout.HelpBox(L("This lock affects the current selection.", "このロックは現在の選択中ターゲットに影響します。"), MessageType.Warning);
 
                 var isMine = IsCurrentUser(lockItem);
+                var primaryLabel = GetLockPrimaryActionLabel(lockItem, isMine);
+                var primaryTooltip = GetLockPrimaryActionTooltip(lockItem, isMine);
+                var canUsePrimaryAction = CanUseLockPrimaryAction(lockItem, isMine);
                 var buttons = new List<ActionButtonInfo>
                 {
                     new ActionButtonInfo
                     {
                         label = L("Ping", "表示"),
+                        tooltip = L("Ping the asset in Project or select the related target.", "Project で対象を表示、または関連ターゲットを選択します。"),
                         enabled = IsProjectRelativePath(lockItem.assetPath),
                         onClick = () => PingAssetPath(lockItem.assetPath)
                     },
                     new ActionButtonInfo
                     {
-                        label = isMine ? L("Unlock", "解除") : L("Request Unlock", "解除申請"),
-                        enabled = _backend != null,
+                        label = primaryLabel,
+                        tooltip = primaryTooltip,
+                        enabled = _backend != null && canUsePrimaryAction,
                         onClick = () =>
                         {
                             if (isMine)
@@ -923,6 +956,9 @@ public class CollabSyncWindow : EditorWindow
                     buttons.Add(new ActionButtonInfo
                     {
                         label = L("Force Unlock", "強制解除"),
+                        tooltip = L(
+                            "Admin only. Bypasses retained-lock safety and removes the teammate lock immediately.",
+                            "管理者専用です。保持ロックの安全確認を無視して、他ユーザーのロックを即時に削除します。"),
                         enabled = _backend != null,
                         onClick = () => ForceUnlockAsync(lockItem)
                     });
@@ -1209,6 +1245,32 @@ public class CollabSyncWindow : EditorWindow
             _cfg.beepOnNewMemo = nextBeepOnNewMemo;
             CollabSyncConfig.SaveEditorAsset(_cfg);
         }
+
+        EditorGUILayout.Space(10);
+        EditorGUILayout.LabelField(L("Git-aware Locks", "Git連動ロック"), EditorStyles.boldLabel);
+        var retainedLocksToggleContent = new GUIContent(
+            L("Keep retained locks until merged", "マージされるまで保持ロックを残す"),
+            L(
+                "When enabled, manual locks can stay retained until the protected branch contains the lock owner's commit.",
+                "有効にすると、手動ロックは保護ブランチに所有者のコミットが入るまで保持状態のまま残ります。"));
+        var nextEnableGitAwareRetainedLocks = EditorGUILayout.ToggleLeft(retainedLocksToggleContent, _cfg.enableGitAwareRetainedLocks);
+        if (_cfg != null && nextEnableGitAwareRetainedLocks != _cfg.enableGitAwareRetainedLocks)
+        {
+            _cfg.enableGitAwareRetainedLocks = nextEnableGitAwareRetainedLocks;
+            CollabSyncConfig.SaveEditorAsset(_cfg);
+            RefreshSnapshotAsync();
+            Repaint();
+        }
+
+        EditorGUILayout.HelpBox(
+            _cfg != null && _cfg.enableGitAwareRetainedLocks
+                ? L(
+                    "ON: Manual locks may switch to Retained instead of disappearing immediately. This helps keep GitHub branch work safe until the protected branch picks up the commit.",
+                    "ON: 手動ロックはすぐに消えず、保持状態に切り替わることがあります。保護ブランチにコミットが入るまで GitHub のブランチ作業を安全寄りに保ちます。")
+                : L(
+                    "OFF: Unlock behaves in the old simple way and removes your lock immediately.",
+                    "OFF: 従来どおり、解除操作ですぐにロックを消します。"),
+            MessageType.Info);
 
         EditorGUILayout.Space(10);
         EditorGUILayout.LabelField(L("Doctor", "Doctor"), EditorStyles.boldLabel);
@@ -1659,15 +1721,72 @@ public class CollabSyncWindow : EditorWindow
         RefreshSnapshotAsync();
     }
 
+    private async Task<LockReleaseOutcome> ReleaseOwnedLockAsync(string assetPath)
+    {
+        if (_backend == null || string.IsNullOrEmpty(assetPath))
+            return LockReleaseOutcome.None;
+
+        var success = await _backend.ReleaseLockAsync(assetPath, CurrentUserId, CurrentUserName);
+        var doc = await _backend.LoadOnceAsync() ?? new CollabStateDocument();
+        var mine = (doc.locks ?? new List<LockItem>())
+            .FirstOrDefault(l => l != null
+                                 && string.Equals(l.assetPath, assetPath, StringComparison.Ordinal)
+                                 && IsCurrentUser(l));
+
+        if (mine != null && CollabSyncGitUtility.IsRetainedLock(mine))
+            return LockReleaseOutcome.Retained;
+
+        return success ? LockReleaseOutcome.Released : LockReleaseOutcome.None;
+    }
+
+    private void NotifyLockReleaseResult(int releasedCount, int retainedCount)
+    {
+        if (retainedCount > 0)
+        {
+            ShowNotification(new GUIContent(LF(
+                releasedCount > 0
+                    ? "{0} released / {1} retained until the protected branch picks up the commit."
+                    : "{0} lock(s) were retained until the protected branch picks up the commit.",
+                releasedCount > 0
+                    ? "{0} 件解除 / {1} 件は保護ブランチにコミットが入るまで保持されました。"
+                    : "{0} 件のロックは保護ブランチにコミットが入るまで保持されました。",
+                releasedCount > 0 ? releasedCount : retainedCount,
+                retainedCount)));
+            return;
+        }
+
+        if (releasedCount > 0)
+        {
+            ShowNotification(new GUIContent(LF(
+                "{0} lock(s) released.",
+                "{0} 件のロックを解除しました。",
+                releasedCount)));
+            return;
+        }
+
+        ShowNotification(new GUIContent(L(
+            "No lock was released.",
+            "解除できるロックはありませんでした。")));
+    }
+
     private async void UnlockSelectionLocksAsync(List<LockItem> locks)
     {
         if (_backend == null || locks == null || locks.Count == 0)
             return;
 
-        foreach (var lockItem in locks)
-            await _backend.ReleaseLockAsync(lockItem.assetPath, CurrentUserId, CurrentUserName);
+        int releasedCount = 0;
+        int retainedCount = 0;
+        foreach (var assetPath in locks.Select(l => l?.assetPath).Where(x => !string.IsNullOrEmpty(x)).Distinct())
+        {
+            var outcome = await ReleaseOwnedLockAsync(assetPath);
+            if (outcome == LockReleaseOutcome.Released)
+                releasedCount++;
+            else if (outcome == LockReleaseOutcome.Retained)
+                retainedCount++;
+        }
 
         RefreshSnapshotAsync();
+        NotifyLockReleaseResult(releasedCount, retainedCount);
     }
 
     private async void ForceUnlockAsync(LockItem lockItem)
@@ -1708,10 +1827,19 @@ public class CollabSyncWindow : EditorWindow
             .Distinct()
             .ToArray();
 
+        int releasedCount = 0;
+        int retainedCount = 0;
         foreach (var assetPath in mine)
-            await _backend.ReleaseLockAsync(assetPath, CurrentUserId, CurrentUserName);
+        {
+            var outcome = await ReleaseOwnedLockAsync(assetPath);
+            if (outcome == LockReleaseOutcome.Released)
+                releasedCount++;
+            else if (outcome == LockReleaseOutcome.Retained)
+                retainedCount++;
+        }
 
         RefreshSnapshotAsync();
+        NotifyLockReleaseResult(releasedCount, retainedCount);
     }
 
     private ActionButtonInfo[] CreateSelectionActionButtons(SelectionTargetInfo selection, List<LockItem> mineLocks)
@@ -1764,7 +1892,8 @@ public class CollabSyncWindow : EditorWindow
             {
                 using (new EditorGUI.DisabledScope(button == null || !button.enabled))
                 {
-                    if (GUILayout.Button(button?.label ?? "", GUILayout.ExpandWidth(true)))
+                    var content = new GUIContent(button?.label ?? "", button?.tooltip ?? "");
+                    if (GUILayout.Button(content, GUILayout.ExpandWidth(true)))
                         button?.onClick?.Invoke();
                 }
             }
@@ -1778,7 +1907,8 @@ public class CollabSyncWindow : EditorWindow
             {
                 using (new EditorGUI.DisabledScope(button == null || !button.enabled))
                 {
-                    if (GUILayout.Button(button?.label ?? "", GUILayout.MinWidth(96), GUILayout.ExpandWidth(true)))
+                    var content = new GUIContent(button?.label ?? "", button?.tooltip ?? "");
+                    if (GUILayout.Button(content, GUILayout.MinWidth(96), GUILayout.ExpandWidth(true)))
                         button?.onClick?.Invoke();
                 }
             }
@@ -2006,14 +2136,28 @@ public class CollabSyncWindow : EditorWindow
 
     private void DrawOverviewLine(string label, string value)
     {
+        DrawOverviewLine(label, value, "");
+    }
+
+    private void DrawOverviewLine(string label, string value, string tooltip)
+    {
+        var labelContent = string.IsNullOrEmpty(tooltip) ? new GUIContent(label) : new GUIContent(label, tooltip);
+        var valueContent = string.IsNullOrEmpty(tooltip) ? new GUIContent(value ?? "") : new GUIContent(value ?? "", tooltip);
         if (IsCompactLayout(540f))
         {
-            EditorGUILayout.LabelField(label, EditorStyles.miniBoldLabel);
-            EditorGUILayout.LabelField(value ?? "", _cardDetailStyle);
+            EditorGUILayout.LabelField(labelContent, EditorStyles.miniBoldLabel);
+            EditorGUILayout.LabelField(valueContent, _cardDetailStyle);
             return;
         }
 
-        EditorGUILayout.LabelField(label, value ?? "");
+        EditorGUILayout.LabelField(labelContent, valueContent);
+    }
+
+    private void DrawDetailLine(string label, string value, string tooltip)
+    {
+        var labelContent = string.IsNullOrEmpty(tooltip) ? new GUIContent(label) : new GUIContent(label, tooltip);
+        var valueContent = string.IsNullOrEmpty(tooltip) ? new GUIContent(value ?? "") : new GUIContent(value ?? "", tooltip);
+        EditorGUILayout.LabelField(labelContent, valueContent);
     }
 
     private void ChooseJsonPath()
@@ -2738,7 +2882,10 @@ public class CollabSyncWindow : EditorWindow
         var query = _lockSearch.Trim();
         return (lockItem.assetPath ?? "").IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0
             || DisplayUser(lockItem.ownerId, lockItem.owner).IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0
-            || (lockItem.reason ?? "").IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0;
+            || (lockItem.reason ?? "").IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0
+            || (lockItem.gitBranch ?? "").IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0
+            || (lockItem.gitProtectedBranch ?? "").IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0
+            || FormatLockState(lockItem).IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private List<BackupSnapshotInfo> GetBackups(string resolvedPath, int maxCount)
@@ -2909,6 +3056,133 @@ public class CollabSyncWindow : EditorWindow
         };
     }
 
+    private string FormatLockState(LockItem lockItem)
+    {
+        if (lockItem == null)
+            return L("Unknown", "不明");
+
+        return CollabSyncGitUtility.IsRetainedLock(lockItem)
+            ? L("Retained", "保持")
+            : L("Active", "有効");
+    }
+
+    private bool CanUseLockPrimaryAction(LockItem lockItem, bool isMine)
+    {
+        if (lockItem == null)
+            return false;
+
+        if (!isMine)
+            return true;
+
+        if (!CollabSyncGitUtility.IsRetainedLock(lockItem))
+            return true;
+
+        return !CollabSyncConfig.IsGitAwareRetainedLocksEnabled()
+            || CollabSyncGitUtility.CanReleaseRetainedLock(lockItem);
+    }
+
+    private string GetLockPrimaryActionLabel(LockItem lockItem, bool isMine)
+    {
+        if (!isMine)
+            return L("Request Unlock", "解除申請");
+        if (!CollabSyncGitUtility.IsRetainedLock(lockItem))
+            return L("Unlock", "解除");
+        if (!CollabSyncConfig.IsGitAwareRetainedLocksEnabled())
+            return L("Unlock", "解除");
+
+        return CollabSyncGitUtility.CanReleaseRetainedLock(lockItem)
+            ? L("Release Retained", "保持解除")
+            : L("Waiting For Merge", "マージ待ち");
+    }
+
+    private string GetLockPrimaryActionTooltip(LockItem lockItem, bool isMine)
+    {
+        if (lockItem == null)
+            return "";
+
+        if (!isMine)
+        {
+            return CollabSyncGitUtility.IsRetainedLock(lockItem)
+                ? L(
+                    "This teammate lock is retained until the protected branch contains the recorded commit. Use Force Unlock only if you intentionally want to bypass that safety.",
+                    "この他ユーザーのロックは、記録済みコミットが保護ブランチに入るまで保持されます。意図して安全確認を無視する場合だけ Force Unlock を使ってください。")
+                : L("Send a memo asking the owner to release the lock.", "所有者にロック解除を依頼するメモを送ります。");
+        }
+
+        if (!CollabSyncGitUtility.IsRetainedLock(lockItem))
+            return L("Release your current lock.", "現在のロックを解除します。");
+
+        if (!CollabSyncConfig.IsGitAwareRetainedLocksEnabled())
+            return L("Git-aware retained locks are off, so this lock can be removed immediately.", "Git連動ロックが無効なので、このロックはすぐに解除できます。");
+
+        return CollabSyncGitUtility.CanReleaseRetainedLock(lockItem)
+            ? L(
+                "The protected branch already contains the recorded commit, so this retained lock can now be removed.",
+                "保護ブランチに記録済みコミットが入ったため、この保持ロックを解除できます。")
+            : L(
+                "This lock is waiting for the protected branch to contain the recorded commit. It will stay retained until then, or an admin can Force Unlock it.",
+                "このロックは保護ブランチに記録済みコミットが入るまで待機中です。それまでは保持され、管理者のみ Force Unlock できます。");
+    }
+
+    private string GetLockStateTooltip(LockItem lockItem)
+    {
+        if (lockItem == null)
+            return "";
+
+        return CollabSyncGitUtility.IsRetainedLock(lockItem)
+            ? L(
+                "Retained means the owner tried to unlock after their branch moved forward, but the protected branch does not yet contain the recorded commit.",
+                "保持は、所有者が解除を試みた時点でブランチは進んでいるものの、保護ブランチに記録済みコミットがまだ入っていない状態を意味します。")
+            : L(
+                "Active means the lock is currently held in the normal state.",
+                "有効は、通常状態でロック中であることを示します。");
+    }
+
+    private string GetLockGitTooltip(LockItem lockItem)
+    {
+        if (lockItem == null)
+            return "";
+
+        return L(
+            "Shows the branch and commit recorded when the lock was taken, plus the protected branch used for retained-lock checks.",
+            "ロック取得時に記録したブランチとコミット、および保持判定に使う保護ブランチを表示します。");
+    }
+
+    private string FormatLockGitSummary(LockItem lockItem)
+    {
+        if (lockItem == null)
+            return "";
+
+        var parts = new List<string>();
+        if (!string.IsNullOrEmpty(lockItem.gitBranch))
+            parts.Add(CollabSyncGitUtility.NormalizeBranchLabel(lockItem.gitBranch));
+        if (!string.IsNullOrEmpty(lockItem.gitHeadCommit))
+            parts.Add(CollabSyncGitUtility.FormatShortCommit(lockItem.gitHeadCommit));
+        if (!string.IsNullOrEmpty(lockItem.gitProtectedBranch))
+        {
+            parts.Add(LF("target {0}", "対象 {0}",
+                CollabSyncGitUtility.NormalizeBranchLabel(lockItem.gitProtectedBranch)));
+        }
+
+        return string.Join(" / ", parts.Where(x => !string.IsNullOrEmpty(x)));
+    }
+
+    private string FormatRetainedLockDetail(LockItem lockItem)
+    {
+        if (!CollabSyncGitUtility.IsRetainedLock(lockItem))
+            return "";
+
+        return LF(
+            "This lock stays retained until {0} contains commit {1}.",
+            "このロックは {0} にコミット {1} が入るまで保持されます。",
+            string.IsNullOrEmpty(lockItem?.gitProtectedBranch)
+                ? "main"
+                : CollabSyncGitUtility.NormalizeBranchLabel(lockItem.gitProtectedBranch),
+            string.IsNullOrEmpty(lockItem?.gitHeadCommit)
+                ? "HEAD"
+                : CollabSyncGitUtility.FormatShortCommit(lockItem.gitHeadCommit));
+    }
+
     private string FormatHistoryAction(WorkHistoryItem item)
     {
         if (item == null)
@@ -2918,6 +3192,7 @@ public class CollabSyncWindow : EditorWindow
         {
             "editing" => LF("Started editing {0}", "{0} の編集を開始", string.IsNullOrEmpty(item.context) ? L("item", "対象") : item.context),
             "lock" => L("Locked", "ロック"),
+            "lock-retained" => L("Retained lock", "ロック保持"),
             "unlock" => L("Unlocked", "ロック解除"),
             "force-unlock" => L("Force unlocked", "強制解除"),
             "memo" => L("Added memo", "メモ追加"),
@@ -2957,6 +3232,8 @@ public class CollabSyncWindow : EditorWindow
                     : L("Enabled", "有効化"));
             else if (item.action == "user-delete")
                 parts.Add(LF("Deleted {0}", "{0} を削除", item.detail));
+            else if (item.action == "lock-retained")
+                parts.Add(item.detail);
             else
             {
                 var detail = item.action == "lock" || item.action == "unlock"
@@ -2990,6 +3267,18 @@ public class CollabSyncWindow : EditorWindow
     {
         if (lockItem == null)
             return L("Unknown", "不明");
+        if (CollabSyncGitUtility.IsRetainedLock(lockItem))
+        {
+            return LF(
+                "Until {0} contains {1}",
+                "{0} に {1} が入るまで",
+                string.IsNullOrEmpty(lockItem.gitProtectedBranch)
+                    ? "main"
+                    : CollabSyncGitUtility.NormalizeBranchLabel(lockItem.gitProtectedBranch),
+                string.IsNullOrEmpty(lockItem.gitHeadCommit)
+                    ? "HEAD"
+                    : CollabSyncGitUtility.FormatShortCommit(lockItem.gitHeadCommit));
+        }
         if (lockItem.ttlMs <= 0)
             return L("No expiry", "無期限");
 

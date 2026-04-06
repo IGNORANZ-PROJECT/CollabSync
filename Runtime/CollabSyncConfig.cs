@@ -31,6 +31,9 @@ namespace Ignoranz.CollabSync
         public bool notifyOnNewMemo = true;
         public bool beepOnNewMemo = false;
 
+        [Header("Git-aware Locks")]
+        public bool enableGitAwareRetainedLocks = true;
+
         [Header("Language")]
         public CollabSyncLanguageMode languageMode = CollabSyncLanguageMode.Auto;
 
@@ -46,6 +49,16 @@ namespace Ignoranz.CollabSync
             return CollabSyncBackendUtility.TryResolveJsonPath(this, out var path, out var statusOrError)
                 ? path
                 : statusOrError;
+        }
+
+        public static bool IsGitAwareRetainedLocksEnabled()
+        {
+#if UNITY_EDITOR
+            var cfg = LoadOrCreate();
+#else
+            var cfg = Resources.Load<CollabSyncConfig>("CollabSyncConfig");
+#endif
+            return cfg == null || cfg.enableGitAwareRetainedLocks;
         }
 
 #if UNITY_EDITOR

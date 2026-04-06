@@ -130,8 +130,16 @@ namespace Ignoranz.CollabSync
 
             foreach (var lockItem in doc.locks)
             {
+                lockItem.assetPath ??= "";
                 lockItem.ownerId ??= "";
                 lockItem.owner ??= "";
+                lockItem.reason ??= "";
+                lockItem.state = string.Equals(lockItem.state, CollabSyncGitUtility.RetainedLockState, StringComparison.Ordinal)
+                    ? CollabSyncGitUtility.RetainedLockState
+                    : "";
+                lockItem.gitBranch ??= "";
+                lockItem.gitHeadCommit ??= "";
+                lockItem.gitProtectedBranch ??= "";
             }
 
             foreach (var item in doc.history)
@@ -481,7 +489,12 @@ namespace Ignoranz.CollabSync
                     .Append(lockItem.owner).Append('|')
                     .Append(lockItem.reason).Append('|')
                     .Append(lockItem.createdAt).Append('|')
-                    .Append(lockItem.ttlMs)
+                    .Append(lockItem.ttlMs).Append('|')
+                    .Append(lockItem.state).Append('|')
+                    .Append(lockItem.retainedAt).Append('|')
+                    .Append(lockItem.gitBranch).Append('|')
+                    .Append(lockItem.gitHeadCommit).Append('|')
+                    .Append(lockItem.gitProtectedBranch)
                     .AppendLine();
             }
 
@@ -844,6 +857,10 @@ namespace Ignoranz.CollabSync
 
             bool acquired = false;
             bool requestedAutoLock = IsAutoLockReason(reason);
+            bool gitAwareRetainedLocksEnabled = CollabSyncConfig.IsGitAwareRetainedLocksEnabled();
+            var gitSnapshot = default(GitLockSnapshot);
+            if (gitAwareRetainedLocksEnabled)
+                CollabSyncGitUtility.TryCaptureCurrentLockSnapshot(out gitSnapshot);
             if (MutateDocument(doc =>
             {
                 ownerId = CollabIdentityUtility.Normalize(ownerId);
@@ -865,7 +882,7 @@ namespace Ignoranz.CollabSync
 
                 if (existing == null)
                 {
-                    doc.locks.Add(new LockItem
+                    var lockItem = new LockItem
                     {
                         assetPath = assetPath,
                         ownerId = ownerId,
@@ -873,12 +890,16 @@ namespace Ignoranz.CollabSync
                         reason = reason,
                         createdAt = now,
                         ttlMs = ttlMs
-                    });
+                    };
+                    if (gitAwareRetainedLocksEnabled)
+                        CollabSyncGitUtility.ApplySnapshot(lockItem, gitSnapshot, retained: false);
+                    doc.locks.Add(lockItem);
                     AppendHistory(doc, ownerId, ownerName, "lock", assetPath, "", reason, now);
                 }
                 else
                 {
                     var previousReason = existing.reason;
+                    var wasRetained = CollabSyncGitUtility.IsRetainedLock(existing);
                     if (requestedAutoLock && !IsAutoLockReason(existing.reason))
                     {
                         acquired = true;
@@ -890,6 +911,21 @@ namespace Ignoranz.CollabSync
                     existing.reason = reason;
                     existing.createdAt = now;
                     existing.ttlMs = ttlMs;
+
+                    bool shouldPreserveManualGitBaseline =
+                        gitAwareRetainedLocksEnabled &&
+                        !wasRetained &&
+                        !requestedAutoLock &&
+                        ttlMs <= 0 &&
+                        !string.IsNullOrEmpty(existing.gitHeadCommit);
+
+                    if (!shouldPreserveManualGitBaseline)
+                        CollabSyncGitUtility.ApplySnapshot(existing, gitSnapshot, retained: false);
+                    else
+                    {
+                        existing.state = "";
+                        existing.retainedAt = 0;
+                    }
 
                     if (!requestedAutoLock && !string.Equals(previousReason ?? "", reason ?? "", StringComparison.Ordinal))
                         AppendHistory(doc, ownerId, ownerName, "lock", assetPath, "", reason, now);
@@ -910,6 +946,10 @@ namespace Ignoranz.CollabSync
             await Task.Yield();
 
             bool released = false;
+            bool gitAwareRetainedLocksEnabled = CollabSyncConfig.IsGitAwareRetainedLocksEnabled();
+            var gitSnapshot = default(GitLockSnapshot);
+            if (gitAwareRetainedLocksEnabled)
+                CollabSyncGitUtility.TryCaptureCurrentLockSnapshot(out gitSnapshot);
             if (MutateDocument(doc =>
             {
                 ownerId = CollabIdentityUtility.Normalize(ownerId);
@@ -922,12 +962,41 @@ namespace Ignoranz.CollabSync
                 var existing = doc.locks.FirstOrDefault(l =>
                     string.Equals(l.assetPath, assetPath, StringComparison.Ordinal) &&
                     CollabIdentityUtility.Matches(ownerId, ownerName, l.ownerId, l.owner));
+                if (existing == null)
+                    return false;
+
+                var now = TimeUtil.NowMs();
+                if (gitAwareRetainedLocksEnabled && CollabSyncGitUtility.IsRetainedLock(existing))
+                {
+                    if (!CollabSyncGitUtility.CanReleaseRetainedLock(existing))
+                    {
+                        released = false;
+                        return false;
+                    }
+
+                    int removedRetained = doc.locks.RemoveAll(l =>
+                        string.Equals(l.assetPath, assetPath, StringComparison.Ordinal) &&
+                        CollabIdentityUtility.Matches(ownerId, ownerName, l.ownerId, l.owner));
+                    released = removedRetained > 0;
+                    if (released)
+                        AppendHistory(doc, ownerId, ownerName, "unlock", assetPath, "", existing.reason, now);
+                    return released;
+                }
+
+                if (gitAwareRetainedLocksEnabled && CollabSyncGitUtility.ShouldRetainLockOnRelease(existing, gitSnapshot))
+                {
+                    CollabSyncGitUtility.ApplySnapshot(existing, gitSnapshot, retained: true);
+                    released = true;
+                    AppendHistory(doc, ownerId, ownerName, "lock-retained", assetPath, "", CollabSyncGitUtility.BuildRetainedHistoryDetail(gitSnapshot), now);
+                    return true;
+                }
+
                 int removed = doc.locks.RemoveAll(l =>
                     string.Equals(l.assetPath, assetPath, StringComparison.Ordinal) &&
                     CollabIdentityUtility.Matches(ownerId, ownerName, l.ownerId, l.owner));
                 released = removed > 0;
-                if (released && existing != null)
-                    AppendHistory(doc, ownerId, ownerName, "unlock", assetPath, "", existing.reason, TimeUtil.NowMs());
+                if (released)
+                    AppendHistory(doc, ownerId, ownerName, "unlock", assetPath, "", existing.reason, now);
                 return released;
             }))
             {

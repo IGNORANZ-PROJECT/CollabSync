@@ -74,6 +74,7 @@ public static class EditingTracker
             _initialized = true;
 
             _ = SafeSendBeat(_currentAssetPath, _currentContext);
+            _ = SafeReleaseMergedRetainedLocks();
         }
         catch (Exception e)
         {
@@ -90,6 +91,7 @@ public static class EditingTracker
             if (EditorApplication.timeSinceStartup >= _nextGitHeadCheckAt)
             {
                 CheckGitHeadChange();
+                _ = SafeReleaseMergedRetainedLocks();
                 _nextGitHeadCheckAt = EditorApplication.timeSinceStartup + GIT_HEAD_CHECK_SEC;
             }
 
@@ -319,6 +321,12 @@ public static class EditingTracker
         catch (Exception e) { Debug.LogError($"[CollabSync] Git HEAD change handling error: {e}"); }
     }
 
+    static async Task SafeReleaseMergedRetainedLocks()
+    {
+        try { await ReleaseMergedRetainedLocksAsync(); }
+        catch (Exception e) { Debug.LogError($"[CollabSync] Retained lock release error: {e}"); }
+    }
+
     static async Task HandleGitHeadChangeAsync(bool createPullReminderMemo)
     {
         await ReleaseAllAutoLocksOnCommitAsync();
@@ -350,6 +358,41 @@ public static class EditingTracker
             await _backend.ReleaseLockAsync(key, meId, meName);
 
         _lastAutoLockKey = "";
+    }
+
+    static async Task ReleaseMergedRetainedLocksAsync()
+    {
+        if (_backend == null)
+            return;
+        if (!CollabSyncConfig.IsGitAwareRetainedLocksEnabled())
+            return;
+
+        var meId = CollabSyncUser.UserId;
+        var meName = CollabSyncUser.UserName;
+        if (string.IsNullOrEmpty(meId) && string.IsNullOrEmpty(meName))
+            return;
+
+        var latest = CollabSyncEvents.Latest ?? new CollabStateDocument();
+        var hasRetainedMine = (latest.locks ?? new List<LockItem>())
+            .Any(l => l != null
+                      && CollabIdentityUtility.Matches(meId, meName, l.ownerId, l.owner)
+                      && CollabSyncGitUtility.IsRetainedLock(l));
+        if (!hasRetainedMine)
+            return;
+
+        var doc = await _backend.LoadOnceAsync() ?? new CollabStateDocument();
+        var keys = (doc.locks ?? new List<LockItem>())
+            .Where(l => l != null
+                        && CollabIdentityUtility.Matches(meId, meName, l.ownerId, l.owner)
+                        && CollabSyncGitUtility.IsRetainedLock(l)
+                        && CollabSyncGitUtility.CanReleaseRetainedLock(l))
+            .Select(l => l.assetPath)
+            .Where(x => !string.IsNullOrEmpty(x))
+            .Distinct()
+            .ToArray();
+
+        foreach (var key in keys)
+            await _backend.ReleaseLockAsync(key, meId, meName);
     }
 
     static async Task CreatePullReminderMemoAsync()
