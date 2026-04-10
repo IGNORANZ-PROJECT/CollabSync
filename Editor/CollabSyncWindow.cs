@@ -2380,6 +2380,8 @@ public class CollabSyncWindow : EditorWindow
             presence.userId ??= "";
             presence.user ??= "";
             presence.assetPath ??= "";
+            presence.targetKey ??= "";
+            presence.targetName ??= "";
             presence.context ??= "";
         }
 
@@ -2750,6 +2752,15 @@ public class CollabSyncWindow : EditorWindow
         if (!selection.HasTarget || string.IsNullOrEmpty(selection.assetPath))
             return new List<EditingPresence>();
 
+        if (!string.IsNullOrEmpty(selection.objectLockKey))
+        {
+            var objectEditors = alive
+                .Where(p => string.Equals(p.targetKey ?? "", selection.objectLockKey, StringComparison.Ordinal))
+                .ToList();
+            if (objectEditors.Count > 0)
+                return objectEditors;
+        }
+
         if (selection.isFolder)
         {
             var prefix = selection.assetPath.TrimEnd('/') + "/";
@@ -2757,8 +2768,19 @@ public class CollabSyncWindow : EditorWindow
                        .ToList();
         }
 
-        return alive.Where(p => string.Equals(p.assetPath, selection.assetPath, StringComparison.Ordinal))
-                   .ToList();
+        var preferredKey = string.IsNullOrEmpty(selection.preferredLockKey)
+            ? selection.assetPath
+            : selection.preferredLockKey;
+        var exactEditors = alive
+            .Where(p => string.Equals(p.targetKey ?? "", preferredKey, StringComparison.Ordinal))
+            .ToList();
+        if (exactEditors.Count > 0)
+            return exactEditors;
+
+        return alive.Where(p =>
+                string.Equals(p.assetPath, selection.assetPath, StringComparison.Ordinal) &&
+                (string.IsNullOrEmpty(p.targetKey) || string.Equals(p.targetKey, p.assetPath, StringComparison.Ordinal)))
+            .ToList();
     }
 
     private SelectionTargetInfo GetOverviewWorkTarget(List<EditingPresence> alive)
@@ -2774,10 +2796,15 @@ public class CollabSyncWindow : EditorWindow
 
         return new SelectionTargetInfo
         {
-            displayName = Path.GetFileNameWithoutExtension(myPresence.assetPath),
+            displayName = !string.IsNullOrEmpty(myPresence.targetName)
+                ? myPresence.targetName
+                : Path.GetFileNameWithoutExtension(myPresence.assetPath),
             assetPath = myPresence.assetPath,
             context = myPresence.context ?? "",
-            preferredLockKey = myPresence.assetPath,
+            preferredLockKey = string.IsNullOrEmpty(myPresence.targetKey) ? myPresence.assetPath : myPresence.targetKey,
+            objectLockKey = !string.IsNullOrEmpty(myPresence.targetKey) && myPresence.targetKey.StartsWith("obj:", StringComparison.Ordinal)
+                ? myPresence.targetKey
+                : "",
             isFolder = myPresence.assetPath.EndsWith("/", StringComparison.Ordinal)
         };
     }
@@ -3259,6 +3286,9 @@ public class CollabSyncWindow : EditorWindow
 
             return L("Online (no active target)", "オンライン中（作業対象なし）");
         }
+
+        if (!string.IsNullOrEmpty(presence.targetName))
+            return $"{presence.context} / {presence.targetName}";
 
         return $"{presence.context} / {TruncateMiddle(presence.assetPath, IsCompactLayout(620f) ? 40 : 72)}";
     }

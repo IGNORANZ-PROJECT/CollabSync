@@ -119,6 +119,10 @@ namespace Ignoranz.CollabSync
             {
                 presence.userId ??= "";
                 presence.user ??= "";
+                presence.assetPath ??= "";
+                presence.targetKey ??= "";
+                presence.targetName ??= "";
+                presence.context ??= "";
             }
 
             foreach (var memo in doc.memos)
@@ -697,6 +701,7 @@ namespace Ignoranz.CollabSync
                 bool changedTarget =
                     previous == null ||
                     !string.Equals(previous.assetPath ?? "", presence.assetPath ?? "", StringComparison.Ordinal) ||
+                    !string.Equals(previous.targetKey ?? "", presence.targetKey ?? "", StringComparison.Ordinal) ||
                     !string.Equals(previous.context ?? "", presence.context ?? "", StringComparison.Ordinal);
 
                 if (changedTarget && !string.IsNullOrEmpty(presence.assetPath))

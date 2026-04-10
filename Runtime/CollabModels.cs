@@ -9,6 +9,8 @@ namespace Ignoranz.CollabSync
         public string userId;
         public string user;
         public string assetPath;
+        public string targetKey;
+        public string targetName;
         public string context;   // Scene / Prefab / Asset
         public long heartbeat;   // Unix ms
     }

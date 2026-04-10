@@ -19,6 +19,7 @@ public static class EditingTracker
     const double SCRIPT_POLL_SEC = 0.75;
     const double SCRIPT_OPEN_KEEP_ALIVE_SEC = 20.0;
     const double SCRIPT_EDIT_KEEP_ALIVE_SEC = 20.0;
+    const double PUSH_RECOMMENDATION_COOLDOWN_SEC = 60.0;
     const long   AUTO_LOCK_TTL_MS = 15_000;
     const long   WARN_WITHIN_MS = 10_000;
 
@@ -28,6 +29,7 @@ public static class EditingTracker
 
     static string _currentAssetPath = "";
     static string _currentLockKey = "";
+    static string _currentTargetName = "";
     static string _currentContext   = "";
     static bool _shouldAutoLock;
     static double _nextBeatAt;
@@ -37,11 +39,18 @@ public static class EditingTracker
     static long _lastWarnAt;
     static string _lastAutoLockKey = "";
     static string _lastGitHeadSignature = "";
+    static string _lastPushRecommendationKey = "";
+    static double _lastPushRecommendationAt;
     static string _trackedScriptAssetPath = "";
     static string _trackedScriptSignature = "";
     static double _scriptAutoLockUntil;
     static string _openedScriptAssetPath = "";
     static double _openedScriptAutoLockUntil;
+    static string _transientAssetPath = "";
+    static string _transientLockKey = "";
+    static string _transientTargetName = "";
+    static string _transientContext = "";
+    static double _transientAutoLockUntil;
     static readonly object _lastPresenceLock = new();
     static EditingPresence _lastPublishedPresence;
 
@@ -55,6 +64,7 @@ public static class EditingTracker
             Selection.selectionChanged += () => SafeDetectAll("selectionChanged");
             PrefabStage.prefabStageOpened  += _ => SafeDetectAll("prefabOpened");
             PrefabStage.prefabStageClosing += _ => SafeDetectAll("prefabClosing");
+            Undo.postprocessModifications += OnPostprocessModifications;
 
             SafeDetectAll("init");
             _nextBeatAt = EditorApplication.timeSinceStartup + HEARTBEAT_SEC;
@@ -140,6 +150,12 @@ public static class EditingTracker
 
         _openedScriptAssetPath = assetPath;
         _openedScriptAutoLockUntil = EditorApplication.timeSinceStartup + SCRIPT_OPEN_KEEP_ALIVE_SEC;
+        RegisterTransientAutoLock(
+            Path.GetFileNameWithoutExtension(assetPath),
+            assetPath,
+            assetPath,
+            CollabSyncLocalization.T("Script", "スクリプト"),
+            SCRIPT_OPEN_KEEP_ALIVE_SEC);
         SafeDetectAll("scriptOpened");
         return false;
     }
@@ -152,15 +168,26 @@ public static class EditingTracker
 
     static void DetectAll(string reason)
     {
+        if (TryGetTransientAutoLockTarget(out var transientTarget))
+        {
+            SetTarget(
+                transientTarget.displayName,
+                transientTarget.assetPath,
+                transientTarget.lockKey,
+                transientTarget.context,
+                shouldAutoLock: true);
+            return;
+        }
+
         if (CollabSyncEditorLockUtility.TryGetCurrentLockTarget(out var target))
         {
             ApplyScriptAutoLockHeuristics(target);
-            SetTarget(target.assetPath, target.lockKey, target.context, target.shouldAutoLock);
+            SetTarget(target.displayName, target.assetPath, target.lockKey, target.context, target.shouldAutoLock);
             return;
         }
 
         ClearTrackedScriptTarget();
-        SetTarget("", "", "", false);
+        SetTarget("", "", "", "", false);
     }
 
     static void ApplyScriptAutoLockHeuristics(CollabSyncEditorLockUtility.LockTarget target)
@@ -174,6 +201,9 @@ public static class EditingTracker
             return;
         }
 
+        target.displayName = string.IsNullOrEmpty(target.displayName)
+            ? Path.GetFileNameWithoutExtension(target.assetPath)
+            : target.displayName;
         target.context = CollabSyncLocalization.T("Script", "スクリプト");
         target.shouldAutoLock = target.shouldAutoLock || ShouldAutoLockScript(target.assetPath);
     }
@@ -213,6 +243,12 @@ public static class EditingTracker
             return false;
 
         _scriptAutoLockUntil = Math.Max(_scriptAutoLockUntil, _openedScriptAutoLockUntil);
+        RegisterTransientAutoLock(
+            Path.GetFileNameWithoutExtension(assetPath),
+            assetPath,
+            assetPath,
+            CollabSyncLocalization.T("Script", "スクリプト"),
+            SCRIPT_OPEN_KEEP_ALIVE_SEC);
         return true;
     }
 
@@ -239,6 +275,61 @@ public static class EditingTracker
             && assetPath.EndsWith(".cs", StringComparison.OrdinalIgnoreCase);
     }
 
+    internal static void NotifyImportedAssets(string[] importedAssets)
+    {
+        try
+        {
+            foreach (var importedPath in importedAssets ?? Array.Empty<string>())
+            {
+                if (!string.IsNullOrEmpty(GetPushRecommendationKey(importedPath, "")))
+                    MaybeWarnPushRecommended(importedPath, "", Path.GetFileName(importedPath));
+            }
+
+            var importedScripts = (importedAssets ?? Array.Empty<string>())
+                .Where(IsScriptAssetPath)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (importedScripts.Count == 0)
+                return;
+
+            string candidate = null;
+            if (importedScripts.Count == 1)
+            {
+                candidate = importedScripts[0];
+            }
+            else
+            {
+                var selectedPath = AssetDatabase.GetAssetPath(Selection.activeObject);
+                if (IsScriptAssetPath(selectedPath))
+                    candidate = importedScripts.FirstOrDefault(path => string.Equals(path, selectedPath, StringComparison.OrdinalIgnoreCase));
+
+                if (candidate == null && IsScriptAssetPath(_openedScriptAssetPath))
+                    candidate = importedScripts.FirstOrDefault(path => string.Equals(path, _openedScriptAssetPath, StringComparison.OrdinalIgnoreCase));
+
+                if (candidate == null && IsScriptAssetPath(_trackedScriptAssetPath))
+                    candidate = importedScripts.FirstOrDefault(path => string.Equals(path, _trackedScriptAssetPath, StringComparison.OrdinalIgnoreCase));
+            }
+
+            if (string.IsNullOrEmpty(candidate))
+                return;
+
+            _trackedScriptAssetPath = candidate;
+            _trackedScriptSignature = GetScriptFileSignature(candidate);
+            _openedScriptAssetPath = candidate;
+            _openedScriptAutoLockUntil = EditorApplication.timeSinceStartup + SCRIPT_EDIT_KEEP_ALIVE_SEC;
+            RegisterTransientAutoLock(
+                Path.GetFileNameWithoutExtension(candidate),
+                candidate,
+                candidate,
+                CollabSyncLocalization.T("Script", "スクリプト"),
+                SCRIPT_EDIT_KEEP_ALIVE_SEC);
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[CollabSync] Script import tracking error: {e}");
+        }
+    }
+
     static string GetScriptFileSignature(string assetPath)
     {
         if (!IsScriptAssetPath(assetPath))
@@ -259,9 +350,10 @@ public static class EditingTracker
         }
     }
 
-    static void SetTarget(string assetPath, string lockKey, string context, bool shouldAutoLock)
+    static void SetTarget(string displayName, string assetPath, string lockKey, string context, bool shouldAutoLock)
     {
-        if (_currentAssetPath == assetPath &&
+        if (_currentTargetName == displayName &&
+            _currentAssetPath == assetPath &&
             _currentLockKey == lockKey &&
             _currentContext == context &&
             _shouldAutoLock == shouldAutoLock)
@@ -269,6 +361,7 @@ public static class EditingTracker
             return;
         }
 
+        _currentTargetName = displayName;
         _currentAssetPath = assetPath;
         _currentLockKey   = lockKey;
         _currentContext   = context;
@@ -305,6 +398,8 @@ public static class EditingTracker
             userId    = meId,
             user      = meName,
             assetPath = assetPath,
+            targetKey = string.IsNullOrEmpty(_currentLockKey) ? assetPath : _currentLockKey,
+            targetName = _currentTargetName,
             context   = context,
             heartbeat = TimeUtil.NowMs()
         };
@@ -320,14 +415,14 @@ public static class EditingTracker
         foreach (var other in doc.presences)
         {
             if (CollabIdentityUtility.Matches(meId, meName, other.userId, other.user)) continue;
-            if (!string.Equals(other.assetPath, assetPath, StringComparison.Ordinal)) continue;
+            if (!PresenceTargetsConflict(other, assetPath, p.targetKey)) continue;
             if (now - other.heartbeat > WARN_WITHIN_MS) continue;
 
             var otherName = CollabIdentityUtility.DisplayName(other.userId, other.user);
-            warnSignature = (other.userId ?? otherName) + "|" + assetPath;
+            warnSignature = (other.userId ?? otherName) + "|" + (p.targetKey ?? assetPath);
             if (_lastWarnSignature != warnSignature || now - _lastWarnAt > WARN_WITHIN_MS)
             {
-                Debug.LogWarning($"[CollabSync] {otherName} is editing: {assetPath} (soft lock)");
+                Debug.LogWarning($"[CollabSync] {otherName} is editing: {FormatPresenceConflictTarget(p)} (soft lock)");
                 _lastWarnSignature = warnSignature;
                 _lastWarnAt = now;
             }
@@ -350,6 +445,8 @@ public static class EditingTracker
                 userId = presence.userId ?? "",
                 user = presence.user ?? "",
                 assetPath = presence.assetPath ?? "",
+                targetKey = presence.targetKey ?? "",
+                targetName = presence.targetName ?? "",
                 context = presence.context ?? "",
                 heartbeat = presence.heartbeat
             };
@@ -371,11 +468,247 @@ public static class EditingTracker
                 userId = _lastPublishedPresence.userId ?? "",
                 user = _lastPublishedPresence.user ?? "",
                 assetPath = _lastPublishedPresence.assetPath ?? "",
+                targetKey = _lastPublishedPresence.targetKey ?? "",
+                targetName = _lastPublishedPresence.targetName ?? "",
                 context = _lastPublishedPresence.context ?? "",
                 heartbeat = _lastPublishedPresence.heartbeat
             };
             return true;
         }
+    }
+
+    static UndoPropertyModification[] OnPostprocessModifications(UndoPropertyModification[] modifications)
+    {
+        try
+        {
+            if (modifications == null)
+                return modifications;
+
+            foreach (var modification in modifications)
+            {
+                var target = modification.currentValue.target ?? modification.previousValue.target;
+                if (!TryBuildTransientTargetFromObject(target, out var displayName, out var assetPath, out var lockKey, out var context))
+                    continue;
+
+                RegisterTransientAutoLock(displayName, assetPath, lockKey, context, SCRIPT_EDIT_KEEP_ALIVE_SEC);
+                break;
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[CollabSync] Inspector modification tracking error: {e}");
+        }
+
+        return modifications;
+    }
+
+    static bool TryBuildTransientTargetFromObject(UnityEngine.Object target, out string displayName, out string assetPath, out string lockKey, out string context)
+    {
+        displayName = "";
+        assetPath = "";
+        lockKey = "";
+        context = "";
+
+        if (target == null)
+            return false;
+
+        var component = target as Component;
+        var gameObject = target as GameObject ?? component?.gameObject;
+        if (gameObject != null)
+        {
+            var stage = PrefabStageUtility.GetCurrentPrefabStage();
+            if (stage != null && !string.IsNullOrEmpty(stage.assetPath) && gameObject.scene == stage.scene)
+            {
+                displayName = gameObject.name;
+                assetPath = stage.assetPath;
+                lockKey = CollabSyncEditorLockUtility.GetGameObjectLockKey(gameObject) ?? stage.assetPath;
+                context = CollabSyncLocalization.T("Prefab Object", "Prefab オブジェクト");
+                return !string.IsNullOrEmpty(lockKey);
+            }
+
+            if (gameObject.scene.IsValid() && !string.IsNullOrEmpty(gameObject.scene.path))
+            {
+                displayName = gameObject.name;
+                assetPath = gameObject.scene.path;
+                lockKey = CollabSyncEditorLockUtility.GetGameObjectLockKey(gameObject) ?? gameObject.scene.path;
+                context = CollabSyncLocalization.T("Scene Object", "シーンオブジェクト");
+                return !string.IsNullOrEmpty(lockKey);
+            }
+        }
+
+        var projectPath = AssetDatabase.GetAssetPath(target);
+        if (string.IsNullOrEmpty(projectPath))
+        {
+            if (IsProjectWideSettingsTarget(target))
+            {
+                MaybeWarnPushRecommended(
+                    "ProjectSettings/" + target.GetType().Name,
+                    CollabSyncLocalization.T("Project Settings", "プロジェクト設定"),
+                    target.GetType().Name);
+                return false;
+            }
+
+            if (Selection.activeGameObject == null)
+            {
+                var stage = PrefabStageUtility.GetCurrentPrefabStage();
+                if (stage != null && !string.IsNullOrEmpty(stage.assetPath))
+                {
+                    displayName = Path.GetFileNameWithoutExtension(stage.assetPath);
+                    assetPath = stage.assetPath;
+                    lockKey = stage.assetPath;
+                    context = CollabSyncLocalization.T("Prefab Settings", "Prefab 設定");
+                    return true;
+                }
+
+                var scene = EditorSceneManager.GetActiveScene();
+                if (scene.IsValid() && !string.IsNullOrEmpty(scene.path))
+                {
+                    displayName = Path.GetFileNameWithoutExtension(scene.path);
+                    assetPath = scene.path;
+                    lockKey = scene.path;
+                    context = CollabSyncLocalization.T("Scene Settings", "シーン設定");
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        displayName = IsScriptAssetPath(projectPath)
+            ? Path.GetFileNameWithoutExtension(projectPath)
+            : target.name;
+        assetPath = projectPath;
+        lockKey = AssetDatabase.IsValidFolder(projectPath) ? projectPath.TrimEnd('/') + "/" : projectPath;
+        context = CollabSyncEditorLockUtility.GetAssetContext(projectPath);
+        MaybeWarnPushRecommended(projectPath, context, displayName);
+        return !string.IsNullOrEmpty(lockKey);
+    }
+
+    static void RegisterTransientAutoLock(string displayName, string assetPath, string lockKey, string context, double keepAliveSec)
+    {
+        if (string.IsNullOrEmpty(lockKey))
+            return;
+
+        _transientTargetName = displayName ?? "";
+        _transientAssetPath = assetPath ?? "";
+        _transientLockKey = lockKey ?? "";
+        _transientContext = context ?? "";
+        _transientAutoLockUntil = Math.Max(_transientAutoLockUntil, EditorApplication.timeSinceStartup + keepAliveSec);
+        MaybeWarnPushRecommended(assetPath, context, displayName);
+        SafeDetectAll("transientAutoLock");
+    }
+
+    static bool TryGetTransientAutoLockTarget(out CollabSyncEditorLockUtility.LockTarget target)
+    {
+        target = null;
+        if (EditorApplication.timeSinceStartup > _transientAutoLockUntil || string.IsNullOrEmpty(_transientLockKey))
+            return false;
+
+        target = new CollabSyncEditorLockUtility.LockTarget
+        {
+            displayName = _transientTargetName ?? "",
+            assetPath = _transientAssetPath ?? "",
+            lockKey = _transientLockKey ?? "",
+            context = _transientContext ?? "",
+            shouldAutoLock = true
+        };
+        return true;
+    }
+
+    static bool PresenceTargetsConflict(EditingPresence other, string assetPath, string targetKey)
+    {
+        if (other == null)
+            return false;
+
+        var myTargetKey = targetKey ?? "";
+        var otherTargetKey = other.targetKey ?? "";
+
+        if (!string.IsNullOrEmpty(myTargetKey) && myTargetKey.StartsWith("obj:", StringComparison.Ordinal))
+        {
+            if (string.Equals(otherTargetKey, myTargetKey, StringComparison.Ordinal))
+                return true;
+
+            return (string.IsNullOrEmpty(otherTargetKey)
+                    || string.Equals(otherTargetKey, other.assetPath ?? "", StringComparison.Ordinal))
+                && string.Equals(other.assetPath ?? "", assetPath ?? "", StringComparison.Ordinal);
+        }
+
+        if (!string.IsNullOrEmpty(otherTargetKey) && otherTargetKey.StartsWith("obj:", StringComparison.Ordinal))
+            return false;
+
+        return string.Equals(other.assetPath ?? "", assetPath ?? "", StringComparison.Ordinal);
+    }
+
+    static string FormatPresenceConflictTarget(EditingPresence presence)
+    {
+        if (presence == null)
+            return "";
+
+        if (!string.IsNullOrEmpty(presence.targetName))
+            return presence.targetName;
+        if (!string.IsNullOrEmpty(presence.assetPath))
+            return presence.assetPath;
+        return CollabSyncLocalization.T("current target", "現在の対象");
+    }
+
+    static void MaybeWarnPushRecommended(string assetPath, string context, string displayName)
+    {
+        var recommendationKey = GetPushRecommendationKey(assetPath, context);
+        if (string.IsNullOrEmpty(recommendationKey))
+            return;
+
+        var now = EditorApplication.timeSinceStartup;
+        if (string.Equals(_lastPushRecommendationKey, recommendationKey, StringComparison.Ordinal)
+            && now - _lastPushRecommendationAt < PUSH_RECOMMENDATION_COOLDOWN_SEC)
+        {
+            return;
+        }
+
+        _lastPushRecommendationKey = recommendationKey;
+        _lastPushRecommendationAt = now;
+
+        var label = !string.IsNullOrEmpty(displayName)
+            ? displayName
+            : (!string.IsNullOrEmpty(assetPath) ? assetPath : recommendationKey);
+        Debug.LogWarning($"[CollabSync] {label} affects shared project-wide settings. Push soon after finishing this change to reduce severe conflicts.");
+    }
+
+    static string GetPushRecommendationKey(string assetPath, string context)
+    {
+        var normalizedPath = (assetPath ?? "").Replace('\\', '/');
+        if (normalizedPath.StartsWith("ProjectSettings/", StringComparison.Ordinal))
+            return normalizedPath;
+        if (string.Equals(normalizedPath, "Packages/manifest.json", StringComparison.Ordinal)
+            || string.Equals(normalizedPath, "Packages/packages-lock.json", StringComparison.Ordinal))
+        {
+            return normalizedPath;
+        }
+
+        var normalizedContext = (context ?? "").Trim();
+        if (string.Equals(normalizedContext, CollabSyncLocalization.T("Project Settings", "プロジェクト設定"), StringComparison.Ordinal)
+            || string.Equals(normalizedContext, CollabSyncLocalization.T("Package Manifest", "パッケージ設定"), StringComparison.Ordinal))
+        {
+            return normalizedContext;
+        }
+
+        return "";
+    }
+
+    static bool IsProjectWideSettingsTarget(UnityEngine.Object target)
+    {
+        if (target == null)
+            return false;
+
+        var typeName = target.GetType().Name ?? "";
+        return typeName.IndexOf("PlayerSettings", StringComparison.Ordinal) >= 0
+            || typeName.IndexOf("EditorBuildSettings", StringComparison.Ordinal) >= 0
+            || typeName.IndexOf("QualitySettings", StringComparison.Ordinal) >= 0
+            || typeName.IndexOf("GraphicsSettings", StringComparison.Ordinal) >= 0
+            || typeName.IndexOf("TagManager", StringComparison.Ordinal) >= 0
+            || typeName.IndexOf("InputManager", StringComparison.Ordinal) >= 0
+            || typeName.IndexOf("AudioManager", StringComparison.Ordinal) >= 0
+            || typeName.IndexOf("PhysicsManager", StringComparison.Ordinal) >= 0
+            || typeName.IndexOf("ProjectSettings", StringComparison.Ordinal) >= 0;
     }
 
     static async Task SyncAutoLockAsync()
@@ -663,6 +996,14 @@ public static class EditingTracker
             return rawPath;
 
         return Path.GetFullPath(Path.Combine(projectRoot, rawPath));
+    }
+}
+
+class EditingTrackerAssetPostprocessor : AssetPostprocessor
+{
+    static void OnPostprocessAllAssets(string[] importedAssets, string[] deletedAssets, string[] movedAssets, string[] movedFromAssetPaths)
+    {
+        EditingTracker.NotifyImportedAssets(importedAssets);
     }
 }
 #endif

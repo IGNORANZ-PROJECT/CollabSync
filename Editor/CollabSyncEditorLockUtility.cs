@@ -10,6 +10,7 @@ public static class CollabSyncEditorLockUtility
 {
     public sealed class LockTarget
     {
+        public string displayName = "";
         public string assetPath = "";
         public string lockKey = "";
         public string context = "";
@@ -27,6 +28,7 @@ public static class CollabSyncEditorLockUtility
             if (stage != null && !string.IsNullOrEmpty(stage.assetPath) && activeGameObject.scene == stage.scene)
             {
                 var objectKey = GetGameObjectLockKey(activeGameObject);
+                target.displayName = activeGameObject.name;
                 target.assetPath = stage.assetPath;
                 target.lockKey = string.IsNullOrEmpty(objectKey) ? stage.assetPath : objectKey;
                 target.context = CollabSyncLocalization.T("Prefab Object", "Prefab オブジェクト");
@@ -37,6 +39,7 @@ public static class CollabSyncEditorLockUtility
             if (activeGameObject.scene.IsValid() && !string.IsNullOrEmpty(activeGameObject.scene.path))
             {
                 var objectKey = GetGameObjectLockKey(activeGameObject);
+                target.displayName = activeGameObject.name;
                 target.assetPath = activeGameObject.scene.path;
                 target.lockKey = string.IsNullOrEmpty(objectKey) ? activeGameObject.scene.path : objectKey;
                 target.context = CollabSyncLocalization.T("Scene Object", "シーンオブジェクト");
@@ -52,6 +55,7 @@ public static class CollabSyncEditorLockUtility
             if (!string.IsNullOrEmpty(assetPath))
             {
                 bool isFolder = AssetDatabase.IsValidFolder(assetPath);
+                target.displayName = activeObject.name;
                 target.assetPath = assetPath;
                 target.lockKey = isFolder ? assetPath.TrimEnd('/') + "/" : assetPath;
                 target.context = GetAssetContext(assetPath);
@@ -62,6 +66,7 @@ public static class CollabSyncEditorLockUtility
 
         if (stage != null && !string.IsNullOrEmpty(stage.assetPath))
         {
+            target.displayName = System.IO.Path.GetFileNameWithoutExtension(stage.assetPath);
             target.assetPath = stage.assetPath;
             target.lockKey = stage.assetPath;
             target.context = CollabSyncLocalization.T("Prefab", "Prefab");
@@ -72,6 +77,7 @@ public static class CollabSyncEditorLockUtility
         var scene = EditorSceneManager.GetActiveScene();
         if (scene.IsValid() && !string.IsNullOrEmpty(scene.path))
         {
+            target.displayName = System.IO.Path.GetFileNameWithoutExtension(scene.path);
             target.assetPath = scene.path;
             target.lockKey = scene.path;
             target.context = CollabSyncLocalization.T("Scene", "シーン");
