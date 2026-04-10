@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using UnityEditor;
+using UnityEditor.Callbacks;
 using UnityEditor.SceneManagement;
 using UnityEditor.Experimental.SceneManagement; // PrefabStage / PrefabStageUtility
 using UnityEngine;
@@ -15,6 +16,9 @@ public static class EditingTracker
 {
     const double HEARTBEAT_SEC = 5.0;
     const double GIT_HEAD_CHECK_SEC = 2.0;
+    const double SCRIPT_POLL_SEC = 0.75;
+    const double SCRIPT_OPEN_KEEP_ALIVE_SEC = 20.0;
+    const double SCRIPT_EDIT_KEEP_ALIVE_SEC = 20.0;
     const long   AUTO_LOCK_TTL_MS = 15_000;
     const long   WARN_WITHIN_MS = 10_000;
 
@@ -28,10 +32,16 @@ public static class EditingTracker
     static bool _shouldAutoLock;
     static double _nextBeatAt;
     static double _nextGitHeadCheckAt;
+    static double _nextScriptPollAt;
     static string _lastWarnSignature = "";
     static long _lastWarnAt;
     static string _lastAutoLockKey = "";
     static string _lastGitHeadSignature = "";
+    static string _trackedScriptAssetPath = "";
+    static string _trackedScriptSignature = "";
+    static double _scriptAutoLockUntil;
+    static string _openedScriptAssetPath = "";
+    static double _openedScriptAutoLockUntil;
     static readonly object _lastPresenceLock = new();
     static EditingPresence _lastPublishedPresence;
 
@@ -49,6 +59,7 @@ public static class EditingTracker
             SafeDetectAll("init");
             _nextBeatAt = EditorApplication.timeSinceStartup + HEARTBEAT_SEC;
             _nextGitHeadCheckAt = EditorApplication.timeSinceStartup + GIT_HEAD_CHECK_SEC;
+            _nextScriptPollAt = EditorApplication.timeSinceStartup + SCRIPT_POLL_SEC;
         }
         catch (Exception e)
         {
@@ -88,6 +99,14 @@ public static class EditingTracker
         {
             EnsureInit();
 
+            if (EditorApplication.timeSinceStartup >= _nextScriptPollAt)
+            {
+                if (HasActiveScriptSelection())
+                    SafeDetectAll("scriptPolling");
+
+                _nextScriptPollAt = EditorApplication.timeSinceStartup + SCRIPT_POLL_SEC;
+            }
+
             if (EditorApplication.timeSinceStartup >= _nextGitHeadCheckAt)
             {
                 CheckGitHeadChange();
@@ -111,6 +130,20 @@ public static class EditingTracker
         }
     }
 
+    [OnOpenAsset(0)]
+    static bool OnOpenAsset(int instanceID, int line)
+    {
+        var obj = EditorUtility.InstanceIDToObject(instanceID);
+        var assetPath = AssetDatabase.GetAssetPath(obj);
+        if (!IsScriptAssetPath(assetPath))
+            return false;
+
+        _openedScriptAssetPath = assetPath;
+        _openedScriptAutoLockUntil = EditorApplication.timeSinceStartup + SCRIPT_OPEN_KEEP_ALIVE_SEC;
+        SafeDetectAll("scriptOpened");
+        return false;
+    }
+
     static void SafeDetectAll(string reason)
     {
         try { DetectAll(reason); }
@@ -121,11 +154,109 @@ public static class EditingTracker
     {
         if (CollabSyncEditorLockUtility.TryGetCurrentLockTarget(out var target))
         {
+            ApplyScriptAutoLockHeuristics(target);
             SetTarget(target.assetPath, target.lockKey, target.context, target.shouldAutoLock);
             return;
         }
 
+        ClearTrackedScriptTarget();
         SetTarget("", "", "", false);
+    }
+
+    static void ApplyScriptAutoLockHeuristics(CollabSyncEditorLockUtility.LockTarget target)
+    {
+        if (target == null)
+            return;
+
+        if (!IsScriptAssetPath(target.assetPath))
+        {
+            ClearTrackedScriptTarget();
+            return;
+        }
+
+        target.context = CollabSyncLocalization.T("Script", "スクリプト");
+        target.shouldAutoLock = target.shouldAutoLock || ShouldAutoLockScript(target.assetPath);
+    }
+
+    static bool ShouldAutoLockScript(string assetPath)
+    {
+        var now = EditorApplication.timeSinceStartup;
+        var signature = GetScriptFileSignature(assetPath);
+        if (string.IsNullOrEmpty(signature))
+            return ConsumeScriptOpenIntent(assetPath, now);
+
+        if (!string.Equals(_trackedScriptAssetPath, assetPath, StringComparison.Ordinal))
+        {
+            _trackedScriptAssetPath = assetPath;
+            _trackedScriptSignature = signature;
+            return ConsumeScriptOpenIntent(assetPath, now);
+        }
+
+        if (!string.Equals(_trackedScriptSignature, signature, StringComparison.Ordinal))
+        {
+            _trackedScriptSignature = signature;
+            _scriptAutoLockUntil = now + SCRIPT_EDIT_KEEP_ALIVE_SEC;
+            return true;
+        }
+
+        if (now <= _scriptAutoLockUntil)
+            return true;
+
+        return ConsumeScriptOpenIntent(assetPath, now);
+    }
+
+    static bool ConsumeScriptOpenIntent(string assetPath, double now)
+    {
+        if (!string.Equals(_openedScriptAssetPath, assetPath, StringComparison.Ordinal))
+            return false;
+        if (now > _openedScriptAutoLockUntil)
+            return false;
+
+        _scriptAutoLockUntil = Math.Max(_scriptAutoLockUntil, _openedScriptAutoLockUntil);
+        return true;
+    }
+
+    static void ClearTrackedScriptTarget()
+    {
+        _trackedScriptAssetPath = "";
+        _trackedScriptSignature = "";
+        _scriptAutoLockUntil = 0;
+    }
+
+    static bool HasActiveScriptSelection()
+    {
+        var activeObject = Selection.activeObject;
+        if (activeObject == null)
+            return false;
+
+        var assetPath = AssetDatabase.GetAssetPath(activeObject);
+        return IsScriptAssetPath(assetPath);
+    }
+
+    static bool IsScriptAssetPath(string assetPath)
+    {
+        return !string.IsNullOrEmpty(assetPath)
+            && assetPath.EndsWith(".cs", StringComparison.OrdinalIgnoreCase);
+    }
+
+    static string GetScriptFileSignature(string assetPath)
+    {
+        if (!IsScriptAssetPath(assetPath))
+            return "";
+
+        try
+        {
+            var fullPath = Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), assetPath));
+            var info = new FileInfo(fullPath);
+            if (!info.Exists)
+                return "";
+
+            return info.LastWriteTimeUtc.Ticks.ToString() + ":" + info.Length.ToString();
+        }
+        catch
+        {
+            return "";
+        }
     }
 
     static void SetTarget(string assetPath, string lockKey, string context, bool shouldAutoLock)

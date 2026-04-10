@@ -131,6 +131,8 @@ public static class CollabSyncEditorLockUtility
     {
         if (AssetDatabase.IsValidFolder(assetPath))
             return CollabSyncLocalization.T("Folder", "フォルダ");
+        if (assetPath.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
+            return CollabSyncLocalization.T("Script", "スクリプト");
         if (assetPath.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
             return CollabSyncLocalization.T("Scene", "シーン");
         if (assetPath.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase))
