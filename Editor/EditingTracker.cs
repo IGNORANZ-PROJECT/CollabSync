@@ -16,12 +16,30 @@ public static class EditingTracker
 {
     const double HEARTBEAT_SEC = 5.0;
     const double GIT_HEAD_CHECK_SEC = 2.0;
-    const double SCRIPT_POLL_SEC = 0.75;
-    const double SCRIPT_OPEN_KEEP_ALIVE_SEC = 20.0;
-    const double SCRIPT_EDIT_KEEP_ALIVE_SEC = 20.0;
+    const double DIRTY_AUTO_LOCK_KEEP_ALIVE_SEC = 6.0;
+    const double SCRIPT_OPEN_KEEP_ALIVE_SEC = 12.0;
+    const double SCRIPT_EDIT_KEEP_ALIVE_SEC = 12.0;
+    const double TRANSIENT_AUTO_LOCK_KEEP_ALIVE_SEC = 8.0;
     const double PUSH_RECOMMENDATION_COOLDOWN_SEC = 60.0;
     const long   AUTO_LOCK_TTL_MS = 15_000;
     const long   WARN_WITHIN_MS = 10_000;
+
+    sealed class TrackedPropertyChange
+    {
+        public string baselineSignature = "";
+    }
+
+    sealed class AutoLockState
+    {
+        public string displayName = "";
+        public string assetPath = "";
+        public string lockKey = "";
+        public string context = "";
+        public bool requiresDirtyState;
+        public double keepAliveUntil;
+        public long activityId;
+        public readonly Dictionary<string, TrackedPropertyChange> trackedChanges = new(StringComparer.Ordinal);
+    }
 
     static bool _initialized;
     static CollabSyncConfig _cfg;
@@ -34,23 +52,15 @@ public static class EditingTracker
     static bool _shouldAutoLock;
     static double _nextBeatAt;
     static double _nextGitHeadCheckAt;
-    static double _nextScriptPollAt;
     static string _lastWarnSignature = "";
     static long _lastWarnAt;
-    static string _lastAutoLockKey = "";
     static string _lastGitHeadSignature = "";
     static string _lastPushRecommendationKey = "";
     static double _lastPushRecommendationAt;
-    static string _trackedScriptAssetPath = "";
-    static string _trackedScriptSignature = "";
-    static double _scriptAutoLockUntil;
     static string _openedScriptAssetPath = "";
-    static double _openedScriptAutoLockUntil;
-    static string _transientAssetPath = "";
-    static string _transientLockKey = "";
-    static string _transientTargetName = "";
-    static string _transientContext = "";
-    static double _transientAutoLockUntil;
+    static readonly Dictionary<string, AutoLockState> _autoLockStates = new(StringComparer.Ordinal);
+    static readonly Dictionary<string, long> _suppressedAutoLockActivityIds = new(StringComparer.Ordinal);
+    static long _nextAutoLockActivityId;
     static readonly object _lastPresenceLock = new();
     static EditingPresence _lastPublishedPresence;
 
@@ -69,7 +79,6 @@ public static class EditingTracker
             SafeDetectAll("init");
             _nextBeatAt = EditorApplication.timeSinceStartup + HEARTBEAT_SEC;
             _nextGitHeadCheckAt = EditorApplication.timeSinceStartup + GIT_HEAD_CHECK_SEC;
-            _nextScriptPollAt = EditorApplication.timeSinceStartup + SCRIPT_POLL_SEC;
         }
         catch (Exception e)
         {
@@ -109,14 +118,6 @@ public static class EditingTracker
         {
             EnsureInit();
 
-            if (EditorApplication.timeSinceStartup >= _nextScriptPollAt)
-            {
-                if (HasActiveScriptSelection())
-                    SafeDetectAll("scriptPolling");
-
-                _nextScriptPollAt = EditorApplication.timeSinceStartup + SCRIPT_POLL_SEC;
-            }
-
             if (EditorApplication.timeSinceStartup >= _nextGitHeadCheckAt)
             {
                 CheckGitHeadChange();
@@ -149,13 +150,14 @@ public static class EditingTracker
             return false;
 
         _openedScriptAssetPath = assetPath;
-        _openedScriptAutoLockUntil = EditorApplication.timeSinceStartup + SCRIPT_OPEN_KEEP_ALIVE_SEC;
-        RegisterTransientAutoLock(
+        RegisterAutoLockTarget(
             Path.GetFileNameWithoutExtension(assetPath),
             assetPath,
             assetPath,
             CollabSyncLocalization.T("Script", "スクリプト"),
-            SCRIPT_OPEN_KEEP_ALIVE_SEC);
+            SCRIPT_OPEN_KEEP_ALIVE_SEC,
+            requiresDirtyState: false,
+            isFreshActivity: true);
         SafeDetectAll("scriptOpened");
         return false;
     }
@@ -168,25 +170,24 @@ public static class EditingTracker
 
     static void DetectAll(string reason)
     {
-        if (TryGetTransientAutoLockTarget(out var transientTarget))
-        {
-            SetTarget(
-                transientTarget.displayName,
-                transientTarget.assetPath,
-                transientTarget.lockKey,
-                transientTarget.context,
-                shouldAutoLock: true);
-            return;
-        }
-
         if (CollabSyncEditorLockUtility.TryGetCurrentLockTarget(out var target))
         {
             ApplyScriptAutoLockHeuristics(target);
+            if (target.shouldAutoLock && !string.IsNullOrEmpty(target.lockKey))
+            {
+                RegisterAutoLockTarget(
+                    target.displayName,
+                    target.assetPath,
+                    target.lockKey,
+                    target.context,
+                    DIRTY_AUTO_LOCK_KEEP_ALIVE_SEC,
+                    requiresDirtyState: true,
+                    isFreshActivity: false);
+            }
             SetTarget(target.displayName, target.assetPath, target.lockKey, target.context, target.shouldAutoLock);
             return;
         }
 
-        ClearTrackedScriptTarget();
         SetTarget("", "", "", "", false);
     }
 
@@ -196,77 +197,12 @@ public static class EditingTracker
             return;
 
         if (!IsScriptAssetPath(target.assetPath))
-        {
-            ClearTrackedScriptTarget();
             return;
-        }
 
         target.displayName = string.IsNullOrEmpty(target.displayName)
             ? Path.GetFileNameWithoutExtension(target.assetPath)
             : target.displayName;
         target.context = CollabSyncLocalization.T("Script", "スクリプト");
-        target.shouldAutoLock = target.shouldAutoLock || ShouldAutoLockScript(target.assetPath);
-    }
-
-    static bool ShouldAutoLockScript(string assetPath)
-    {
-        var now = EditorApplication.timeSinceStartup;
-        var signature = GetScriptFileSignature(assetPath);
-        if (string.IsNullOrEmpty(signature))
-            return ConsumeScriptOpenIntent(assetPath, now);
-
-        if (!string.Equals(_trackedScriptAssetPath, assetPath, StringComparison.Ordinal))
-        {
-            _trackedScriptAssetPath = assetPath;
-            _trackedScriptSignature = signature;
-            return ConsumeScriptOpenIntent(assetPath, now);
-        }
-
-        if (!string.Equals(_trackedScriptSignature, signature, StringComparison.Ordinal))
-        {
-            _trackedScriptSignature = signature;
-            _scriptAutoLockUntil = now + SCRIPT_EDIT_KEEP_ALIVE_SEC;
-            return true;
-        }
-
-        if (now <= _scriptAutoLockUntil)
-            return true;
-
-        return ConsumeScriptOpenIntent(assetPath, now);
-    }
-
-    static bool ConsumeScriptOpenIntent(string assetPath, double now)
-    {
-        if (!string.Equals(_openedScriptAssetPath, assetPath, StringComparison.Ordinal))
-            return false;
-        if (now > _openedScriptAutoLockUntil)
-            return false;
-
-        _scriptAutoLockUntil = Math.Max(_scriptAutoLockUntil, _openedScriptAutoLockUntil);
-        RegisterTransientAutoLock(
-            Path.GetFileNameWithoutExtension(assetPath),
-            assetPath,
-            assetPath,
-            CollabSyncLocalization.T("Script", "スクリプト"),
-            SCRIPT_OPEN_KEEP_ALIVE_SEC);
-        return true;
-    }
-
-    static void ClearTrackedScriptTarget()
-    {
-        _trackedScriptAssetPath = "";
-        _trackedScriptSignature = "";
-        _scriptAutoLockUntil = 0;
-    }
-
-    static bool HasActiveScriptSelection()
-    {
-        var activeObject = Selection.activeObject;
-        if (activeObject == null)
-            return false;
-
-        var assetPath = AssetDatabase.GetAssetPath(activeObject);
-        return IsScriptAssetPath(assetPath);
     }
 
     static bool IsScriptAssetPath(string assetPath)
@@ -305,48 +241,24 @@ public static class EditingTracker
 
                 if (candidate == null && IsScriptAssetPath(_openedScriptAssetPath))
                     candidate = importedScripts.FirstOrDefault(path => string.Equals(path, _openedScriptAssetPath, StringComparison.OrdinalIgnoreCase));
-
-                if (candidate == null && IsScriptAssetPath(_trackedScriptAssetPath))
-                    candidate = importedScripts.FirstOrDefault(path => string.Equals(path, _trackedScriptAssetPath, StringComparison.OrdinalIgnoreCase));
             }
 
             if (string.IsNullOrEmpty(candidate))
                 return;
 
-            _trackedScriptAssetPath = candidate;
-            _trackedScriptSignature = GetScriptFileSignature(candidate);
             _openedScriptAssetPath = candidate;
-            _openedScriptAutoLockUntil = EditorApplication.timeSinceStartup + SCRIPT_EDIT_KEEP_ALIVE_SEC;
-            RegisterTransientAutoLock(
+            RegisterAutoLockTarget(
                 Path.GetFileNameWithoutExtension(candidate),
                 candidate,
                 candidate,
                 CollabSyncLocalization.T("Script", "スクリプト"),
-                SCRIPT_EDIT_KEEP_ALIVE_SEC);
+                SCRIPT_EDIT_KEEP_ALIVE_SEC,
+                requiresDirtyState: false,
+                isFreshActivity: true);
         }
         catch (Exception e)
         {
             Debug.LogError($"[CollabSync] Script import tracking error: {e}");
-        }
-    }
-
-    static string GetScriptFileSignature(string assetPath)
-    {
-        if (!IsScriptAssetPath(assetPath))
-            return "";
-
-        try
-        {
-            var fullPath = Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), assetPath));
-            var info = new FileInfo(fullPath);
-            if (!info.Exists)
-                return "";
-
-            return info.LastWriteTimeUtc.Ticks.ToString() + ":" + info.Length.ToString();
-        }
-        catch
-        {
-            return "";
         }
     }
 
@@ -484,14 +396,22 @@ public static class EditingTracker
             if (modifications == null)
                 return modifications;
 
+            var refreshedLockKeys = new HashSet<string>(StringComparer.Ordinal);
             foreach (var modification in modifications)
             {
                 var target = modification.currentValue.target ?? modification.previousValue.target;
                 if (!TryBuildTransientTargetFromObject(target, out var displayName, out var assetPath, out var lockKey, out var context))
                     continue;
 
-                RegisterTransientAutoLock(displayName, assetPath, lockKey, context, SCRIPT_EDIT_KEEP_ALIVE_SEC);
-                break;
+                RegisterAutoLockTarget(
+                    displayName,
+                    assetPath,
+                    lockKey,
+                    context,
+                    TRANSIENT_AUTO_LOCK_KEEP_ALIVE_SEC,
+                    requiresDirtyState: true,
+                    isFreshActivity: refreshedLockKeys.Add(lockKey));
+                TrackPropertyModification(lockKey, modification.previousValue, modification.currentValue);
             }
         }
         catch (Exception e)
@@ -584,35 +504,118 @@ public static class EditingTracker
         return !string.IsNullOrEmpty(lockKey);
     }
 
-    static void RegisterTransientAutoLock(string displayName, string assetPath, string lockKey, string context, double keepAliveSec)
+    static void RegisterAutoLockTarget(string displayName, string assetPath, string lockKey, string context, double keepAliveSec, bool requiresDirtyState, bool isFreshActivity)
     {
         if (string.IsNullOrEmpty(lockKey))
             return;
 
-        _transientTargetName = displayName ?? "";
-        _transientAssetPath = assetPath ?? "";
-        _transientLockKey = lockKey ?? "";
-        _transientContext = context ?? "";
-        _transientAutoLockUntil = Math.Max(_transientAutoLockUntil, EditorApplication.timeSinceStartup + keepAliveSec);
+        if (!_autoLockStates.TryGetValue(lockKey, out var state))
+        {
+            state = new AutoLockState
+            {
+                lockKey = lockKey,
+                activityId = ++_nextAutoLockActivityId
+            };
+            _autoLockStates[lockKey] = state;
+            isFreshActivity = true;
+        }
+        else if (isFreshActivity)
+        {
+            state.activityId = ++_nextAutoLockActivityId;
+        }
+
+        state.displayName = displayName ?? "";
+        state.assetPath = assetPath ?? "";
+        state.context = context ?? "";
+        state.requiresDirtyState = requiresDirtyState;
+        state.keepAliveUntil = Math.Max(state.keepAliveUntil, EditorApplication.timeSinceStartup + keepAliveSec);
+
+        if (isFreshActivity)
+            _suppressedAutoLockActivityIds.Remove(lockKey);
+
         MaybeWarnPushRecommended(assetPath, context, displayName);
-        SafeDetectAll("transientAutoLock");
     }
 
-    static bool TryGetTransientAutoLockTarget(out CollabSyncEditorLockUtility.LockTarget target)
+    static void TrackPropertyModification(string lockKey, PropertyModification previousValue, PropertyModification currentValue)
     {
-        target = null;
-        if (EditorApplication.timeSinceStartup > _transientAutoLockUntil || string.IsNullOrEmpty(_transientLockKey))
-            return false;
+        if (string.IsNullOrEmpty(lockKey))
+            return;
+        if (!_autoLockStates.TryGetValue(lockKey, out var state) || state == null)
+            return;
 
-        target = new CollabSyncEditorLockUtility.LockTarget
+        var propertyKey = GetTrackedPropertyKey(currentValue);
+        if (string.IsNullOrEmpty(propertyKey))
+            propertyKey = GetTrackedPropertyKey(previousValue);
+        if (string.IsNullOrEmpty(propertyKey))
+            return;
+
+        var currentSignature = GetTrackedPropertyValueSignature(currentValue);
+        if (!state.trackedChanges.TryGetValue(propertyKey, out var trackedChange))
         {
-            displayName = _transientTargetName ?? "",
-            assetPath = _transientAssetPath ?? "",
-            lockKey = _transientLockKey ?? "",
-            context = _transientContext ?? "",
-            shouldAutoLock = true
-        };
-        return true;
+            trackedChange = new TrackedPropertyChange
+            {
+                baselineSignature = GetTrackedPropertyValueSignature(previousValue)
+            };
+        }
+
+        if (string.Equals(trackedChange.baselineSignature, currentSignature, StringComparison.Ordinal))
+        {
+            state.trackedChanges.Remove(propertyKey);
+            return;
+        }
+
+        state.trackedChanges[propertyKey] = trackedChange;
+    }
+
+    static string GetTrackedPropertyKey(PropertyModification modification)
+    {
+        if (modification == null || modification.target == null || string.IsNullOrEmpty(modification.propertyPath))
+            return "";
+
+        var targetKey = GetTrackedUnityObjectKey(modification.target);
+        if (string.IsNullOrEmpty(targetKey))
+            return "";
+
+        return targetKey + "|" + modification.propertyPath;
+    }
+
+    static string GetTrackedPropertyValueSignature(PropertyModification modification)
+    {
+        if (modification == null)
+            return "";
+
+        return (modification.value ?? "") + "|" + GetTrackedUnityObjectKey(modification.objectReference);
+    }
+
+    static string GetTrackedUnityObjectKey(UnityEngine.Object target)
+    {
+        if (target == null)
+            return "";
+
+        try
+        {
+            var globalId = GlobalObjectId.GetGlobalObjectIdSlow(target);
+            if (globalId.identifierType != 0)
+                return globalId.ToString();
+        }
+        catch
+        {
+        }
+
+        var assetPath = AssetDatabase.GetAssetPath(target);
+        if (!string.IsNullOrEmpty(assetPath))
+            return "asset:" + assetPath;
+
+        return target.GetType().FullName + "#" + target.GetInstanceID();
+    }
+
+    internal static void SuppressAutoLockForKey(string lockKey)
+    {
+        if (string.IsNullOrEmpty(lockKey))
+            return;
+
+        if (_autoLockStates.TryGetValue(lockKey, out var state))
+            _suppressedAutoLockActivityIds[lockKey] = state.activityId;
     }
 
     static bool PresenceTargetsConflict(EditingPresence other, string assetPath, string targetKey)
@@ -711,6 +714,86 @@ public static class EditingTracker
             || typeName.IndexOf("ProjectSettings", StringComparison.Ordinal) >= 0;
     }
 
+    static bool IsAutoLockSuppressed(AutoLockState state)
+    {
+        return state != null
+            && _suppressedAutoLockActivityIds.TryGetValue(state.lockKey, out var suppressedActivityId)
+            && suppressedActivityId == state.activityId;
+    }
+
+    static void PruneAutoLockStates()
+    {
+        var now = EditorApplication.timeSinceStartup;
+        var removeKeys = new List<string>();
+
+        foreach (var pair in _autoLockStates)
+        {
+            var state = pair.Value;
+            if (state == null)
+            {
+                removeKeys.Add(pair.Key);
+                continue;
+            }
+
+            if (IsAutoLockStateStillDirty(state))
+                continue;
+
+            if (state.keepAliveUntil <= now)
+                removeKeys.Add(pair.Key);
+        }
+
+        foreach (var key in removeKeys)
+            _autoLockStates.Remove(key);
+    }
+
+    static bool IsAutoLockStateStillDirty(AutoLockState state)
+    {
+        if (state == null || string.IsNullOrEmpty(state.assetPath))
+            return false;
+
+        if (state.trackedChanges.Count > 0)
+            return true;
+
+        if (state.lockKey.StartsWith("obj:", StringComparison.Ordinal))
+            return false;
+
+        if (CollabSyncGitUtility.IsPathModifiedInWorkingTree(state.assetPath))
+            return true;
+
+        if (state.assetPath.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+            return IsSceneDirty(state.assetPath);
+
+        if (state.assetPath.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase))
+            return IsPrefabDirty(state.assetPath);
+
+        var asset = AssetDatabase.LoadMainAssetAtPath(state.assetPath);
+        return asset != null && EditorUtility.IsDirty(asset);
+    }
+
+    static bool IsSceneOrPrefabDirty(string assetPath)
+    {
+        return assetPath.EndsWith(".unity", StringComparison.OrdinalIgnoreCase)
+            ? IsSceneDirty(assetPath)
+            : assetPath.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase) && IsPrefabDirty(assetPath);
+    }
+
+    static bool IsSceneDirty(string scenePath)
+    {
+        var activeScene = EditorSceneManager.GetActiveScene();
+        return activeScene.IsValid()
+            && string.Equals(activeScene.path, scenePath, StringComparison.Ordinal)
+            && activeScene.isDirty;
+    }
+
+    static bool IsPrefabDirty(string prefabPath)
+    {
+        var stage = PrefabStageUtility.GetCurrentPrefabStage();
+        return stage != null
+            && string.Equals(stage.assetPath, prefabPath, StringComparison.Ordinal)
+            && stage.scene.IsValid()
+            && stage.scene.isDirty;
+    }
+
     static async Task SyncAutoLockAsync()
     {
         if (_backend == null)
@@ -721,42 +804,31 @@ public static class EditingTracker
         if (string.IsNullOrEmpty(meId) && string.IsNullOrEmpty(meName))
             return;
 
-        if (!_shouldAutoLock || string.IsNullOrEmpty(_currentLockKey))
-        {
-            if (!string.IsNullOrEmpty(_lastAutoLockKey))
-                await ReleaseAutoLockIfNeededAsync(_lastAutoLockKey, meId, meName);
+        PruneAutoLockStates();
 
-            _lastAutoLockKey = "";
-            return;
-        }
+        var desiredStates = _autoLockStates.Values
+            .Where(state => state != null && !IsAutoLockSuppressed(state))
+            .ToList();
 
-        if (!string.IsNullOrEmpty(_lastAutoLockKey) &&
-            !string.Equals(_lastAutoLockKey, _currentLockKey, StringComparison.Ordinal))
-        {
-            await ReleaseAutoLockIfNeededAsync(_lastAutoLockKey, meId, meName);
-        }
+        foreach (var state in desiredStates)
+            await _backend.TryAcquireLockAsync(state.lockKey, meId, meName, "auto-lock", AUTO_LOCK_TTL_MS);
 
-        await _backend.TryAcquireLockAsync(_currentLockKey, meId, meName, "auto-lock", AUTO_LOCK_TTL_MS);
-        _lastAutoLockKey = _currentLockKey;
-    }
-
-    static async Task ReleaseAutoLockIfNeededAsync(string lockKey, string meId, string meName)
-    {
-        if (_backend == null || string.IsNullOrEmpty(lockKey) || (string.IsNullOrEmpty(meId) && string.IsNullOrEmpty(meName)))
-            return;
-
+        var desiredKeys = new HashSet<string>(desiredStates.Select(state => state.lockKey), StringComparer.Ordinal);
         var doc = await _backend.LoadOnceAsync() ?? new CollabStateDocument();
         var now = TimeUtil.NowMs();
-        var existing = doc.locks.FirstOrDefault(l =>
-            l != null &&
-            string.Equals(l.assetPath, lockKey, StringComparison.Ordinal) &&
-            CollabIdentityUtility.Matches(meId, meName, l.ownerId, l.owner) &&
-            CollabSyncEditorLockUtility.IsLockActive(l, now));
+        var staleAutoLocks = (doc.locks ?? new List<LockItem>())
+            .Where(l => l != null
+                        && CollabIdentityUtility.Matches(meId, meName, l.ownerId, l.owner)
+                        && CollabSyncEditorLockUtility.IsLockActive(l, now)
+                        && CollabSyncEditorLockUtility.IsAutoLockReason(l.reason)
+                        && !desiredKeys.Contains(l.assetPath ?? ""))
+            .Select(l => l.assetPath)
+            .Where(path => !string.IsNullOrEmpty(path))
+            .Distinct()
+            .ToArray();
 
-        if (existing == null || !CollabSyncEditorLockUtility.IsAutoLockReason(existing.reason))
-            return;
-
-        await _backend.ReleaseLockAsync(lockKey, meId, meName);
+        foreach (var lockKey in staleAutoLocks)
+            await _backend.ReleaseLockAsync(lockKey, meId, meName);
     }
 
     static void CheckGitHeadChange()
@@ -821,7 +893,8 @@ public static class EditingTracker
         foreach (var key in keys)
             await _backend.ReleaseLockAsync(key, meId, meName);
 
-        _lastAutoLockKey = "";
+        _autoLockStates.Clear();
+        _suppressedAutoLockActivityIds.Clear();
     }
 
     static async Task ReleaseMergedRetainedLocksAsync()

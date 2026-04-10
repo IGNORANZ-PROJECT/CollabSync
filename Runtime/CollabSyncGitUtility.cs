@@ -155,6 +155,25 @@ namespace Ignoranz.CollabSync
                 string.IsNullOrEmpty(shortCommit) ? "HEAD" : shortCommit);
         }
 
+        public static bool IsPathModifiedInWorkingTree(string assetPath)
+        {
+            var normalizedPath = (assetPath ?? "").Replace('\\', '/').Trim();
+            if (string.IsNullOrEmpty(normalizedPath))
+                return false;
+
+            var projectRoot = FindGitProjectRoot(Path.GetDirectoryName(Application.dataPath));
+            if (string.IsNullOrEmpty(projectRoot))
+                return false;
+
+            return TryRunGit(
+                       projectRoot,
+                       $"status --porcelain -- {QuoteArg(normalizedPath)}",
+                       out var output,
+                       out var exitCode)
+                   && exitCode == 0
+                   && !string.IsNullOrWhiteSpace(output);
+        }
+
         static string FindGitProjectRoot(string startDirectory)
         {
             var dir = startDirectory;

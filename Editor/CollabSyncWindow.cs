@@ -1726,6 +1726,7 @@ public class CollabSyncWindow : EditorWindow
         if (_backend == null || string.IsNullOrEmpty(assetPath))
             return LockReleaseOutcome.None;
 
+        EditingTracker.SuppressAutoLockForKey(assetPath);
         var success = await _backend.ReleaseLockAsync(assetPath, CurrentUserId, CurrentUserName);
         var doc = await _backend.LoadOnceAsync() ?? new CollabStateDocument();
         var mine = (doc.locks ?? new List<LockItem>())

@@ -32,7 +32,7 @@ public static class CollabSyncEditorLockUtility
                 target.assetPath = stage.assetPath;
                 target.lockKey = string.IsNullOrEmpty(objectKey) ? stage.assetPath : objectKey;
                 target.context = CollabSyncLocalization.T("Prefab Object", "Prefab オブジェクト");
-                target.shouldAutoLock = stage.scene.IsValid() && stage.scene.isDirty;
+                target.shouldAutoLock = false;
                 return true;
             }
 
@@ -43,7 +43,7 @@ public static class CollabSyncEditorLockUtility
                 target.assetPath = activeGameObject.scene.path;
                 target.lockKey = string.IsNullOrEmpty(objectKey) ? activeGameObject.scene.path : objectKey;
                 target.context = CollabSyncLocalization.T("Scene Object", "シーンオブジェクト");
-                target.shouldAutoLock = activeGameObject.scene.isDirty;
+                target.shouldAutoLock = false;
                 return true;
             }
         }

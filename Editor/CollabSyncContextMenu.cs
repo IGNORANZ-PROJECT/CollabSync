@@ -41,6 +41,7 @@ public static class CollabSyncContextMenu
         {
             bool isFolder = AssetDatabase.IsValidFolder(path);
             string lockKey = isFolder ? (path.TrimEnd('/') + "/") : path;
+            EditingTracker.SuppressAutoLockForKey(lockKey);
             _ = backend.ReleaseLockAsync(lockKey, meId, meName);
         }
     }
@@ -80,7 +81,10 @@ public static class CollabSyncContextMenu
             {
                 // あれば自分のだけ解除（他人のは触らない）
                 if (CollabIdentityUtility.Matches(meId, meName, existing.ownerId, existing.owner))
+                {
+                    EditingTracker.SuppressAutoLockForKey(key);
                     _ = backend.ReleaseLockAsync(key, meId, meName);
+                }
             }
         }
     }
@@ -139,11 +143,15 @@ public static class CollabSyncContextMenu
             // 1) オブジェクト自体
             string gidKey = GetGameObjectLockKey(go);
             if (!string.IsNullOrEmpty(gidKey))
+            {
+                EditingTracker.SuppressAutoLockForKey(gidKey);
                 _ = backend.ReleaseLockAsync(gidKey, meId, meName);
+            }
 
             // 2) 付いている MonoBehaviour のスクリプト .cs
             foreach (var csPath in GetAttachedMonoScriptPaths(go))
             {
+                EditingTracker.SuppressAutoLockForKey(csPath);
                 _ = backend.ReleaseLockAsync(csPath, meId, meName);
             }
         }
@@ -181,7 +189,11 @@ public static class CollabSyncContextMenu
 
             if (hasAnyActiveMine)
             {
-                foreach (var k in keys) _ = backend.ReleaseLockAsync(k, meId, meName);
+                foreach (var k in keys)
+                {
+                    EditingTracker.SuppressAutoLockForKey(k);
+                    _ = backend.ReleaseLockAsync(k, meId, meName);
+                }
             }
             else
             {
