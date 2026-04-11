@@ -915,8 +915,8 @@ public static class EditingTracker
         if (state.assetPath.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase))
             return IsPrefabDirty(state.assetPath);
 
-        var asset = AssetDatabase.LoadMainAssetAtPath(state.assetPath);
-        return asset != null && EditorUtility.IsDirty(asset);
+        var targetAsset = AssetDatabase.LoadMainAssetAtPath(state.assetPath);
+        return targetAsset != null && EditorUtility.IsDirty(targetAsset);
     }
 
     static void RefreshTrackedPropertyChanges(AutoLockState state)
