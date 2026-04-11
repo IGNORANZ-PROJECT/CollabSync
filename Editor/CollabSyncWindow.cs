@@ -95,6 +95,7 @@ public class CollabSyncWindow : EditorWindow
     private bool _memoFilterSelection;
     private NewMemoLinkMode _newMemoLinkMode = NewMemoLinkMode.CurrentSelection;
     private bool _usersSectionExpanded = true;
+    private bool _deletedUsersSectionExpanded;
     private bool _overviewOnlineExpanded;
     private bool _overviewRelatedLocksOnly;
     private int _lockFilter;
@@ -746,6 +747,7 @@ public class CollabSyncWindow : EditorWindow
     private void DrawUsersSection(List<EditingPresence> alive, List<LockItem> activeLocks)
     {
         var users = GetKnownUsers(alive, activeLocks);
+        var deletedUsers = IsCurrentUserRootAdmin() ? GetDeletedUsers() : new List<KnownUserInfo>();
         var onlineCount = users.Count(user => user.isOnline);
         var now = TimeUtil.NowMs();
 
@@ -764,82 +766,135 @@ public class CollabSyncWindow : EditorWindow
         if (users.Count == 0)
         {
             EditorGUILayout.HelpBox(L("No user information yet.", "まだユーザー情報はありません。"), MessageType.Info);
+        }
+        else
+        {
+            foreach (var user in users)
+            {
+                var userKey = UserKey(user.userId, user.displayName);
+                _cachedPresenceByUserKey.TryGetValue(userKey, out var currentPresence);
+                var userLocks = _cachedLocksByUserKey.TryGetValue(userKey, out var cachedLocks)
+                    ? cachedLocks
+                    : new List<LockItem>();
+                var historyKey = UserKey(user.userId, user.displayName);
+                bool expanded = _expandedUserHistories.Contains(historyKey);
+                bool isRootAdmin = CollabIdentityUtility.Matches(user.userId, user.displayName, GetRootAdminUserId(), GetRootAdminUserName());
+                bool isAdmin = _cachedAdminUserKeys.Contains(userKey);
+                bool canDeleteUser = IsCurrentUserRootAdmin() &&
+                                     !isRootAdmin &&
+                                     !IsCurrentUser(user.userId, user.displayName) &&
+                                     !string.IsNullOrEmpty(user.userId);
+
+                using (new GUILayout.VerticalScope("box"))
+                {
+                    var title = isRootAdmin
+                        ? LF("{0} [{1}]", "{0} [{1}]", user.displayName, L("Root Admin", "Root管理者"))
+                        : isAdmin
+                            ? LF("{0} [{1}]", "{0} [{1}]", user.displayName, L("Admin", "管理者"))
+                            : user.displayName;
+                    EditorGUILayout.LabelField(title, EditorStyles.boldLabel);
+                    if (!string.IsNullOrEmpty(user.userId))
+                        DrawOverviewLine(L("User ID", "ユーザーID"), user.userId);
+                    DrawOverviewLine(
+                        L("Status", "状態"),
+                        user.isOnline
+                            ? L("Online", "オンライン")
+                            : L("Offline", "オフライン"));
+
+                    if (currentPresence != null)
+                    {
+                        var targetLabel = string.IsNullOrEmpty(currentPresence.assetPath)
+                            ? currentPresence.context ?? ""
+                            : $"{currentPresence.context} / {TruncateMiddle(currentPresence.assetPath, IsCompactLayout(620f) ? 44 : 72)}";
+                        DrawOverviewLine(L("Current Work", "現在の作業"), targetLabel);
+                        DrawOverviewLine(L("Last Beat", "最終ハートビート"), LF("{0:0.0}s ago", "{0:0.0}秒前", (now - currentPresence.heartbeat) / 1000f));
+                    }
+
+                    DrawOverviewLine(L("Locks", "ロック"), userLocks.Count.ToString());
+                    if (!IsWorkHistoryEnabled())
+                    {
+                        DrawOverviewLine(L("Work History", "作業履歴"), L("Disabled by admin", "管理者により無効"));
+                    }
+                    else
+                    {
+                        DrawActionButtons(
+                            new ActionButtonInfo
+                            {
+                                label = expanded ? L("Hide Work History", "作業履歴を閉じる") : L("Work History", "作業履歴"),
+                                onClick = () =>
+                                {
+                                    if (expanded) _expandedUserHistories.Remove(historyKey);
+                                    else _expandedUserHistories.Add(historyKey);
+                                }
+                            });
+
+                        if (expanded)
+                            DrawUserHistoryList(user.userId, user.displayName);
+                    }
+
+                    if (canDeleteUser)
+                    {
+                        DrawActionButtons(
+                            new ActionButtonInfo
+                            {
+                                label = L("Delete User", "ユーザーを削除"),
+                                tooltip = L("Remove this user from the active list and block the User ID until a Root Admin restores it.",
+                                            "このユーザーをアクティブ一覧から外し、Root管理者が復活するまでその User ID の再書き込みをブロックします。"),
+                                enabled = _backend != null,
+                                onClick = () => DeleteUserAsync(user.userId, user.displayName)
+                            });
+                    }
+                }
+            }
+        }
+
+        if (IsCurrentUserRootAdmin())
+            DrawDeletedUsersSection(deletedUsers);
+    }
+
+    private void DrawDeletedUsersSection(List<KnownUserInfo> deletedUsers)
+    {
+        using (new GUILayout.VerticalScope("box"))
+        {
+            _deletedUsersSectionExpanded = EditorGUILayout.Foldout(
+                _deletedUsersSectionExpanded,
+                LF("Deleted Users ({0})", "削除済みユーザー一覧（{0}）", deletedUsers?.Count ?? 0),
+                true,
+                EditorStyles.foldoutHeader);
+
+            if (!_deletedUsersSectionExpanded)
+                return;
+        }
+
+        EditorGUILayout.HelpBox(
+            L("Only Root Admin can see this list and restore blocked users. Restoring a user removes the block and allows that User ID to write again.",
+              "この一覧は Root管理者だけが表示・復活できます。復活すると削除済みブロックが解除され、その User ID で再び書き込めるようになります。"),
+            MessageType.Info);
+
+        if (deletedUsers == null || deletedUsers.Count == 0)
+        {
+            EditorGUILayout.HelpBox(L("No deleted users.", "削除済みユーザーはいません。"), MessageType.Info);
             return;
         }
 
-        foreach (var user in users)
+        foreach (var user in deletedUsers)
         {
-            var userKey = UserKey(user.userId, user.displayName);
-            _cachedPresenceByUserKey.TryGetValue(userKey, out var currentPresence);
-            var userLocks = _cachedLocksByUserKey.TryGetValue(userKey, out var cachedLocks)
-                ? cachedLocks
-                : new List<LockItem>();
-            var historyKey = UserKey(user.userId, user.displayName);
-            bool expanded = _expandedUserHistories.Contains(historyKey);
-            bool isRootAdmin = CollabIdentityUtility.Matches(user.userId, user.displayName, GetRootAdminUserId(), GetRootAdminUserName());
-            bool isAdmin = _cachedAdminUserKeys.Contains(userKey);
-            bool canDeleteUser = IsCurrentUserRootAdmin() &&
-                                 !isRootAdmin &&
-                                 !IsCurrentUser(user.userId, user.displayName) &&
-                                 !string.IsNullOrEmpty(user.userId);
-
             using (new GUILayout.VerticalScope("box"))
             {
-                var title = isRootAdmin
-                    ? LF("{0} [{1}]", "{0} [{1}]", user.displayName, L("Root Admin", "Root管理者"))
-                    : isAdmin
-                        ? LF("{0} [{1}]", "{0} [{1}]", user.displayName, L("Admin", "管理者"))
-                        : user.displayName;
-                EditorGUILayout.LabelField(title, EditorStyles.boldLabel);
+                EditorGUILayout.LabelField(user.displayName, EditorStyles.boldLabel);
                 if (!string.IsNullOrEmpty(user.userId))
                     DrawOverviewLine(L("User ID", "ユーザーID"), user.userId);
-                DrawOverviewLine(
-                    L("Status", "状態"),
-                    user.isOnline
-                        ? L("Online", "オンライン")
-                        : L("Offline", "オフライン"));
+                DrawOverviewLine(L("Status", "状態"), L("Deleted / Blocked", "削除済み / ブロック中"));
 
-                if (currentPresence != null)
-                {
-                    var targetLabel = string.IsNullOrEmpty(currentPresence.assetPath)
-                        ? currentPresence.context ?? ""
-                        : $"{currentPresence.context} / {TruncateMiddle(currentPresence.assetPath, IsCompactLayout(620f) ? 44 : 72)}";
-                    DrawOverviewLine(L("Current Work", "現在の作業"), targetLabel);
-                    DrawOverviewLine(L("Last Beat", "最終ハートビート"), LF("{0:0.0}s ago", "{0:0.0}秒前", (now - currentPresence.heartbeat) / 1000f));
-                }
-
-                DrawOverviewLine(L("Locks", "ロック"), userLocks.Count.ToString());
-                if (!IsWorkHistoryEnabled())
-                {
-                    DrawOverviewLine(L("Work History", "作業履歴"), L("Disabled by admin", "管理者により無効"));
-                }
-                else
-                {
-                    DrawActionButtons(
-                        new ActionButtonInfo
-                        {
-                            label = expanded ? L("Hide Work History", "作業履歴を閉じる") : L("Work History", "作業履歴"),
-                            onClick = () =>
-                            {
-                                if (expanded) _expandedUserHistories.Remove(historyKey);
-                                else _expandedUserHistories.Add(historyKey);
-                            }
-                        });
-
-                    if (expanded)
-                        DrawUserHistoryList(user.userId, user.displayName);
-                }
-
-                if (canDeleteUser)
-                {
-                    DrawActionButtons(
-                        new ActionButtonInfo
-                        {
-                            label = L("Delete User", "ユーザーを削除"),
-                            enabled = _backend != null,
-                            onClick = () => DeleteUserAsync(user.userId, user.displayName)
-                        });
-                }
+                DrawActionButtons(
+                    new ActionButtonInfo
+                    {
+                        label = L("Restore User", "ユーザーを復活"),
+                        tooltip = L("Remove this user from the deleted list and allow the User ID to join again.",
+                                    "このユーザーを削除済み一覧から外し、その User ID で再参加できるようにします。"),
+                        enabled = _backend != null,
+                        onClick = () => RestoreUserAsync(user.userId, user.displayName)
+                    });
             }
         }
     }
@@ -1160,6 +1215,10 @@ public class CollabSyncWindow : EditorWindow
             CollabSyncUser.UserName = newName;
         EditorGUILayout.LabelField(L("Your User ID", "自分のユーザーID"));
         EditorGUILayout.SelectableLabel(CurrentUserId, EditorStyles.textField, GUILayout.Height(EditorGUIUtility.singleLineHeight + 4));
+        EditorGUILayout.HelpBox(
+            L("User ID is issued once per local user and kept in protected local storage. It is shown here for reference and cannot be edited from CollabSync.",
+              "User ID は各ローカルユーザーごとに一度発行され、保護されたローカル保存領域で固定されます。ここでは確認のみでき、CollabSync から直接変更はできません。"),
+            MessageType.Info);
 
         EditorGUILayout.Space(8);
         DrawLanguageSection();
@@ -1600,6 +1659,40 @@ public class CollabSyncWindow : EditorWindow
         else
         {
             ShowNotification(new GUIContent(L("User deletion was not applied.", "ユーザー削除は適用されませんでした。")));
+        }
+    }
+
+    private async void RestoreUserAsync(string userId, string userName)
+    {
+        if (_backend == null || !IsCurrentUserRootAdmin())
+            return;
+
+        userId = (userId ?? "").Trim();
+        userName = (userName ?? "").Trim();
+        if (string.IsNullOrEmpty(userId))
+            return;
+
+        var label = string.IsNullOrEmpty(userName) ? userId : userName;
+        if (!EditorUtility.DisplayDialog(
+                "CollabSync",
+                LF("Restore user {0}?\n\nThis removes the deleted-user block and allows the same User ID to write again.",
+                   "ユーザー {0} を復活しますか？\n\n削除済みブロックを解除し、同じ User ID で再び書き込めるようにします。",
+                   label),
+                L("Restore User", "ユーザーを復活"),
+                L("Cancel", "キャンセル")))
+        {
+            return;
+        }
+
+        var restored = await _backend.RestoreUserAsync(CurrentUserId, CurrentUserName, userId, userName);
+        if (restored)
+        {
+            RefreshSnapshotAsync();
+            ShowNotification(new GUIContent(LF("{0} was restored.", "{0} を復活しました。", label)));
+        }
+        else
+        {
+            ShowNotification(new GUIContent(L("User restore was not applied.", "ユーザー復活は適用されませんでした。")));
         }
     }
 
@@ -2643,6 +2736,36 @@ public class CollabSyncWindow : EditorWindow
     {
         EnsureDerivedData();
         return _cachedKnownUsers;
+    }
+
+    private List<KnownUserInfo> GetDeletedUsers()
+    {
+        var blockedIds = _doc?.blockedUserIds ?? new List<string>();
+        var blockedNames = _doc?.blockedUsers ?? new List<string>();
+        var deletedUsers = new List<KnownUserInfo>();
+        var seenKeys = new HashSet<string>(StringComparer.Ordinal);
+
+        for (int i = 0; i < Math.Max(blockedIds.Count, blockedNames.Count); i++)
+        {
+            var userId = i < blockedIds.Count ? blockedIds[i] ?? "" : "";
+            var displayName = CollabIdentityUtility.DisplayName(userId, i < blockedNames.Count ? blockedNames[i] ?? "" : "");
+            if (string.IsNullOrEmpty(userId) && string.IsNullOrEmpty(displayName))
+                continue;
+
+            var key = UserKey(userId, displayName);
+            if (!seenKeys.Add(key))
+                continue;
+
+            deletedUsers.Add(new KnownUserInfo
+            {
+                userId = userId,
+                displayName = displayName,
+                isOnline = false
+            });
+        }
+
+        deletedUsers.Sort((a, b) => string.Compare(a.displayName, b.displayName, StringComparison.OrdinalIgnoreCase));
+        return deletedUsers;
     }
 
     private List<KnownUserInfo> GetAdminUsers()

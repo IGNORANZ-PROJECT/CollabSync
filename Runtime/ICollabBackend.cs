@@ -26,6 +26,7 @@ namespace Ignoranz.CollabSync
         Task<bool> AddAdminAsync(string requesterId, string requesterName, string adminUserId, string adminUserName);
         Task<bool> RemoveAdminAsync(string requesterId, string requesterName, string adminUserId);
         Task<bool> DeleteUserAsync(string requesterId, string requesterName, string targetUserId, string targetUserName);
+        Task<bool> RestoreUserAsync(string requesterId, string requesterName, string targetUserId, string targetUserName);
         Task<bool> SetWorkHistoryEnabledAsync(string requesterId, string requesterName, bool enabled);
     }
 }

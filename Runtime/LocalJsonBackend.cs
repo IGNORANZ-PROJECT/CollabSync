@@ -19,6 +19,7 @@ namespace Ignoranz.CollabSync
         static readonly TimeSpan BackupMinInterval = TimeSpan.FromMinutes(15);
 
         readonly string _path;
+        readonly string _projectId;
         readonly string _backupDirectory;
         readonly string _backupPrefix;
         FileSystemWatcher _watcher;
@@ -27,11 +28,12 @@ namespace Ignoranz.CollabSync
         int _raiseVersion;
         long _lastRaisedUpdatedAt = long.MinValue;
 
-        public LocalJsonBackend(string jsonPath)
+        public LocalJsonBackend(string jsonPath, string projectId = "")
         {
             _path = string.IsNullOrWhiteSpace(jsonPath)
                 ? CollabSyncBackendUtility.DefaultLocalJsonPath
                 : jsonPath;
+            _projectId = CollabSyncProtectedStateUtility.NormalizeProjectId(projectId);
 
             var dir = Path.GetDirectoryName(_path);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
@@ -40,6 +42,7 @@ namespace Ignoranz.CollabSync
             _backupPrefix = Path.GetFileNameWithoutExtension(_path) + "-";
 
             EnsureJsonFileExists();
+            UpgradeLegacyPlaintextFileIfNeeded();
 
             try
             {
@@ -154,7 +157,7 @@ namespace Ignoranz.CollabSync
             }
         }
 
-        static bool TryParseDoc(string text, out CollabStateDocument doc)
+        static bool TryParsePlainJsonDoc(string text, out CollabStateDocument doc)
         {
             if (string.IsNullOrWhiteSpace(text))
             {
@@ -186,10 +189,21 @@ namespace Ignoranz.CollabSync
         {
             Normalize(doc);
             var json = ToJson(doc);
-            if (!TryParseDoc(json, out var clone))
+            if (!TryParsePlainJsonDoc(json, out var clone))
                 clone = new CollabStateDocument();
             Normalize(clone);
             return clone;
+        }
+
+        bool TryParseDoc(string storageText, out CollabStateDocument doc)
+        {
+            if (!CollabSyncProtectedStateUtility.TryReadSharedStateJson(storageText, _projectId, out var jsonText, out _))
+            {
+                doc = null;
+                return false;
+            }
+
+            return TryParsePlainJsonDoc(jsonText, out doc);
         }
 
         static bool IsAutoLockReason(string reason)
@@ -357,7 +371,32 @@ namespace Ignoranz.CollabSync
             if (File.Exists(_path)) return;
 
             var init = new CollabStateDocument { updatedAt = TimeUtil.NowMs() };
-            File.WriteAllText(_path, ToJson(init), Encoding.UTF8);
+            File.WriteAllText(_path, ToStorageText(init), Encoding.UTF8);
+        }
+
+        void UpgradeLegacyPlaintextFileIfNeeded()
+        {
+            if (!TryOpenFile(FileAccess.ReadWrite, FileShare.None, out var stream))
+                return;
+
+            using (stream)
+            {
+                var currentText = ReadText(stream);
+                if (CollabSyncProtectedStateUtility.IsProtectedPayload(currentText))
+                    return;
+                if (!TryParsePlainJsonDoc(currentText, out var doc))
+                    return;
+
+                if (!string.IsNullOrWhiteSpace(currentText))
+                    WriteBackup(currentText);
+
+                WriteText(stream, ToStorageText(doc));
+            }
+        }
+
+        string ToStorageText(CollabStateDocument doc)
+        {
+            return CollabSyncProtectedStateUtility.ProtectSharedStateJson(ToJson(doc), _projectId);
         }
 
         string ReadText(FileStream stream)
@@ -463,6 +502,15 @@ namespace Ignoranz.CollabSync
         bool HasMeaningfulChange(CollabStateDocument previousDoc, CollabStateDocument nextDoc)
         {
             return BuildBackupSignature(previousDoc) != BuildBackupSignature(nextDoc);
+        }
+
+        bool HasDocumentChanged(CollabStateDocument previousDoc, CollabStateDocument nextDoc)
+        {
+            var previousComparable = CloneDoc(previousDoc);
+            var nextComparable = CloneDoc(nextDoc);
+            previousComparable.updatedAt = 0;
+            nextComparable.updatedAt = 0;
+            return !string.Equals(ToJson(previousComparable), ToJson(nextComparable), StringComparison.Ordinal);
         }
 
         string BuildBackupSignature(CollabStateDocument doc)
@@ -609,12 +657,12 @@ namespace Ignoranz.CollabSync
                     return false;
 
                 Normalize(workingDoc);
-                workingDoc.updatedAt = TimeUtil.NowMs();
-
-                var nextText = ToJson(workingDoc);
-                if (string.Equals(previousText, nextText, StringComparison.Ordinal))
+                if (!HasDocumentChanged(previousDoc, workingDoc))
                     return false;
 
+                workingDoc.updatedAt = TimeUtil.NowMs();
+
+                var nextText = ToStorageText(workingDoc);
                 CreateBackupIfNeeded(previousText, previousWasValid, previousDoc, workingDoc);
                 WriteText(stream, nextText);
                 return true;
@@ -1194,6 +1242,53 @@ namespace Ignoranz.CollabSync
                     return false;
 
                 AppendHistory(doc, requesterId, requesterName, "user-delete", "", "", displayName, TimeUtil.NowMs());
+                return true;
+            }))
+            {
+                Raise();
+            }
+
+            return changed;
+        }
+
+        public async Task<bool> RestoreUserAsync(string requesterId, string requesterName, string targetUserId, string targetUserName)
+        {
+            await Task.Yield();
+
+            bool changed = false;
+            if (MutateDocument(doc =>
+            {
+                requesterId = CollabIdentityUtility.Normalize(requesterId);
+                requesterName = CollabIdentityUtility.Normalize(requesterName);
+                targetUserId = CollabIdentityUtility.Normalize(targetUserId);
+                targetUserName = CollabIdentityUtility.Normalize(targetUserName);
+                if (IsBlockedUser(doc, requesterId, requesterName))
+                    return false;
+                EnsureAdminBootstrap(doc, requesterId, requesterName);
+                if (!IsRootAdminUser(doc, requesterId, requesterName))
+                    return false;
+
+                if (string.IsNullOrEmpty(targetUserId))
+                    return false;
+                if (!ContainsBlocked(doc, targetUserId, targetUserName, out var blockedIndex))
+                    return false;
+
+                var displayName = targetUserName;
+                if (blockedIndex < doc.blockedUsers.Count)
+                {
+                    displayName = CollabIdentityUtility.DisplayName(
+                        blockedIndex < doc.blockedUserIds.Count ? doc.blockedUserIds[blockedIndex] : targetUserId,
+                        doc.blockedUsers[blockedIndex]);
+                    doc.blockedUsers.RemoveAt(blockedIndex);
+                    if (blockedIndex < doc.blockedUserIds.Count)
+                        doc.blockedUserIds.RemoveAt(blockedIndex);
+                    changed = true;
+                }
+
+                if (!changed)
+                    return false;
+
+                AppendHistory(doc, requesterId, requesterName, "user-restore", "", "", displayName, TimeUtil.NowMs());
                 return true;
             }))
             {

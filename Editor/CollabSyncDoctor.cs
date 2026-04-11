@@ -111,7 +111,7 @@ namespace Ignoranz.CollabSync
                     return FinalizeReport(report);
                 }
 
-                var okPath = EnsureJsonFile(resolvedPath, out var ensureError);
+                var okPath = EnsureJsonFile(resolvedPath, cfg.projectId, out var ensureError);
                 Log(report, L("Local JSON file", "ローカル JSON ファイル"), okPath, resolvedPath);
                 if (!okPath)
                 {
@@ -126,7 +126,7 @@ namespace Ignoranz.CollabSync
                     return FinalizeReport(report);
                 }
 
-                var okRW = VerifyReadWrite(resolvedPath, out var readWriteError);
+                var okRW = VerifyReadWrite(resolvedPath, cfg.projectId, out var readWriteError);
                 Log(report, L("Local JSON read/write", "ローカル JSON の読み書き"), okRW);
                 if (!okRW)
                 {
@@ -141,7 +141,7 @@ namespace Ignoranz.CollabSync
                     return FinalizeReport(report);
                 }
 
-                var backend = new LocalJsonBackend(resolvedPath);
+                var backend = new LocalJsonBackend(resolvedPath, cfg.projectId);
                 var doc = await backend.LoadOnceAsync() ?? new CollabStateDocument();
                 CollabSyncEvents.RaiseDocUpdate(doc);
                 Log(report, L("[OK] Broadcast latest snapshot.", "[OK] 最新スナップショットを配信しました。"));
@@ -170,7 +170,7 @@ namespace Ignoranz.CollabSync
             return FinalizeReport(report);
         }
 
-        static bool EnsureJsonFile(string path, out string error)
+        static bool EnsureJsonFile(string path, string projectId, out string error)
         {
             error = "";
             try
@@ -185,21 +185,26 @@ namespace Ignoranz.CollabSync
                 if (!File.Exists(path))
                 {
                     var init = new CollabStateDocument { updatedAt = TimeUtil.NowMs() };
-                    File.WriteAllText(path, Json(init), Encoding.UTF8);
+                    File.WriteAllText(path, CollabSyncProtectedStateUtility.ProtectSharedStateJson(Json(init), projectId), Encoding.UTF8);
                 }
                 else
                 {
-                    try
+                    var txt = File.ReadAllText(path, Encoding.UTF8);
+                    if (!CollabSyncProtectedStateUtility.TryReadSharedStateJson(txt, projectId, out var jsonText, out var wasProtected))
                     {
-                        var txt = File.ReadAllText(path, Encoding.UTF8);
-                        var d = JsonUtility.FromJson<CollabStateDocument>(txt);
-                        if (d == null)
-                            File.WriteAllText(path, Json(new CollabStateDocument { updatedAt = TimeUtil.NowMs() }), Encoding.UTF8);
+                        error = L("Shared state file could not be decrypted or was tampered with.", "共有状態ファイルを復号できないか、改ざんが検出されました。");
+                        return false;
                     }
-                    catch
+
+                    var d = JsonUtility.FromJson<CollabStateDocument>(jsonText);
+                    if (d == null)
                     {
-                        File.WriteAllText(path, Json(new CollabStateDocument { updatedAt = TimeUtil.NowMs() }), Encoding.UTF8);
+                        error = L("Shared state file could not be parsed.", "共有状態ファイルを解析できませんでした。");
+                        return false;
                     }
+
+                    if (!wasProtected)
+                        File.WriteAllText(path, CollabSyncProtectedStateUtility.ProtectSharedStateJson(Json(d), projectId), Encoding.UTF8);
                 }
                 return true;
             }
@@ -210,13 +215,19 @@ namespace Ignoranz.CollabSync
             }
         }
 
-        static bool VerifyReadWrite(string path, out string error)
+        static bool VerifyReadWrite(string path, string projectId, out string error)
         {
             error = "";
             try
             {
                 var txt = File.ReadAllText(path, Encoding.UTF8);
-                var doc = JsonUtility.FromJson<CollabStateDocument>(txt) ?? new CollabStateDocument();
+                if (!CollabSyncProtectedStateUtility.TryReadSharedStateJson(txt, projectId, out var jsonText, out _))
+                {
+                    error = L("Shared state file could not be decrypted or was tampered with.", "共有状態ファイルを復号できないか、改ざんが検出されました。");
+                    return false;
+                }
+
+                var doc = JsonUtility.FromJson<CollabStateDocument>(jsonText) ?? new CollabStateDocument();
                 doc.memos ??= new List<MemoItem>();
 
                 var tempId = Guid.NewGuid().ToString("N");
@@ -232,16 +243,22 @@ namespace Ignoranz.CollabSync
 
                 doc.memos.Add(tempMemo);
                 doc.updatedAt = TimeUtil.NowMs();
-                File.WriteAllText(path, Json(doc), Encoding.UTF8);
+                File.WriteAllText(path, CollabSyncProtectedStateUtility.ProtectSharedStateJson(Json(doc), projectId), Encoding.UTF8);
 
                 var txt2 = File.ReadAllText(path, Encoding.UTF8);
-                var doc2 = JsonUtility.FromJson<CollabStateDocument>(txt2) ?? new CollabStateDocument();
+                if (!CollabSyncProtectedStateUtility.TryReadSharedStateJson(txt2, projectId, out var jsonText2, out _))
+                {
+                    error = L("Shared state file could not be decrypted after writing.", "書き込み後に共有状態ファイルを復号できませんでした。");
+                    return false;
+                }
+
+                var doc2 = JsonUtility.FromJson<CollabStateDocument>(jsonText2) ?? new CollabStateDocument();
                 doc2.memos ??= new List<MemoItem>();
                 var found = doc2.memos.Exists(m => m.id == tempId);
 
                 doc2.memos.RemoveAll(m => m.id == tempId);
                 doc2.updatedAt = TimeUtil.NowMs();
-                File.WriteAllText(path, Json(doc2), Encoding.UTF8);
+                File.WriteAllText(path, CollabSyncProtectedStateUtility.ProtectSharedStateJson(Json(doc2), projectId), Encoding.UTF8);
 
                 if (!found)
                 {

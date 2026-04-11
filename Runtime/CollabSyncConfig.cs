@@ -16,13 +16,15 @@ namespace Ignoranz.CollabSync
     [CreateAssetMenu(fileName = "CollabSyncConfig", menuName = "IGNORANZ PROJECT/CollabSyncConfig")]
     public class CollabSyncConfig : ScriptableObject
     {
+        public const string DefaultProjectId = "IGNORANZ_PROJECT_DEFAULT";
+
         const string ProjectLocalEditorAssetPath = "Assets/IGNORANZ-PROJECT/CollabSyncSettings/Resources/CollabSyncConfig.asset";
         const string EditorPrefsLocalJsonPathKeyPrefix = "Ignoranz.CollabSync.LocalJsonPath.";
 #if UNITY_EDITOR
         static CollabSyncConfig s_cachedEditorAsset;
 #endif
 
-        public string projectId = "IGNORANZ_PROJECT_DEFAULT";
+        public string projectId = DefaultProjectId;
 
         [Header("Shared State File")]
         public string localJsonPath = CollabSyncBackendUtility.DefaultLocalJsonPath;
