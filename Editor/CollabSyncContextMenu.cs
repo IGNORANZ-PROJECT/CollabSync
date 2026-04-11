@@ -24,7 +24,7 @@ public static class CollabSyncContextMenu
         {
             bool isFolder = AssetDatabase.IsValidFolder(path);
             string lockKey = isFolder ? (path.TrimEnd('/') + "/") : path;
-            _ = backend.TryAcquireLockAsync(lockKey, meId, meName, reason: "context-menu", ttlMs: 0);
+            _ = backend.TryAcquireLockAsync(lockKey, meId, meName, reason: "context-menu", ttlMs: 0, scopeAssetPath: lockKey);
         }
     }
 
@@ -75,7 +75,7 @@ public static class CollabSyncContextMenu
             if (existing == null)
             {
                 // ロックが無ければ取る
-                _ = backend.TryAcquireLockAsync(key, meId, meName, reason: "context-menu", ttlMs: 0);
+                _ = backend.TryAcquireLockAsync(key, meId, meName, reason: "context-menu", ttlMs: 0, scopeAssetPath: key);
             }
             else
             {
@@ -118,15 +118,17 @@ public static class CollabSyncContextMenu
 
         foreach (var go in Selection.gameObjects)
         {
+            var scopeAssetPath = CollabSyncEditorLockUtility.GetGameObjectScopeAssetPath(go);
+
             // 1) オブジェクト自体をグローバルIDでロック
             string gidKey = GetGameObjectLockKey(go);
             if (!string.IsNullOrEmpty(gidKey))
-                _ = backend.TryAcquireLockAsync(gidKey, meId, meName, reason: "object-lock", ttlMs: 0);
+                _ = backend.TryAcquireLockAsync(gidKey, meId, meName, reason: "object-lock", ttlMs: 0, scopeAssetPath: scopeAssetPath);
 
             // 2) 付いている MonoBehaviour のスクリプト .cs もロック
             foreach (var csPath in GetAttachedMonoScriptPaths(go))
             {
-                _ = backend.TryAcquireLockAsync(csPath, meId, meName, reason: "component-script", ttlMs: 0);
+                _ = backend.TryAcquireLockAsync(csPath, meId, meName, reason: "component-script", ttlMs: 0, scopeAssetPath: csPath);
             }
         }
     }
@@ -172,6 +174,7 @@ public static class CollabSyncContextMenu
         foreach (var go in Selection.gameObjects)
         {
             var keys = new List<string>();
+            var scopeAssetPath = CollabSyncEditorLockUtility.GetGameObjectScopeAssetPath(go);
 
             // オブジェクト自体
             string gidKey = GetGameObjectLockKey(go);
@@ -197,7 +200,12 @@ public static class CollabSyncContextMenu
             }
             else
             {
-                foreach (var k in keys) _ = backend.TryAcquireLockAsync(k, meId, meName, reason: "object-lock", ttlMs: 0);
+                foreach (var k in keys)
+                {
+                    var lockScope = CollabSyncEditorLockUtility.IsObjectLockKey(k) ? scopeAssetPath : k;
+                    var reason = CollabSyncEditorLockUtility.IsObjectLockKey(k) ? "object-lock" : "component-script";
+                    _ = backend.TryAcquireLockAsync(k, meId, meName, reason: reason, ttlMs: 0, scopeAssetPath: lockScope);
+                }
             }
         }
     }

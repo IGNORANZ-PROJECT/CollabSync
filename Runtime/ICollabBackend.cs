@@ -18,7 +18,7 @@ namespace Ignoranz.CollabSync
         Task<bool> ForceDeleteMemoAsync(string memoId, string requesterId, string requesterName);
 
         // Lock
-        Task<bool> TryAcquireLockAsync(string assetPath, string ownerId, string ownerName, string reason = "", long ttlMs = 0);
+        Task<bool> TryAcquireLockAsync(string assetPath, string ownerId, string ownerName, string reason = "", long ttlMs = 0, string scopeAssetPath = "");
         Task<bool> ReleaseLockAsync(string assetPath, string ownerId, string ownerName);
         Task<bool> ForceReleaseLockAsync(string assetPath, string requesterId, string requesterName);
 

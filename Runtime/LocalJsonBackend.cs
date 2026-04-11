@@ -135,6 +135,7 @@ namespace Ignoranz.CollabSync
             foreach (var lockItem in doc.locks)
             {
                 lockItem.assetPath ??= "";
+                lockItem.scopeAssetPath ??= "";
                 lockItem.ownerId ??= "";
                 lockItem.owner ??= "";
                 lockItem.reason ??= "";
@@ -489,6 +490,7 @@ namespace Ignoranz.CollabSync
             {
                 builder.Append("lock|")
                     .Append(lockItem.assetPath).Append('|')
+                    .Append(lockItem.scopeAssetPath).Append('|')
                     .Append(lockItem.ownerId).Append('|')
                     .Append(lockItem.owner).Append('|')
                     .Append(lockItem.reason).Append('|')
@@ -856,7 +858,7 @@ namespace Ignoranz.CollabSync
             return deleted;
         }
 
-        public async Task<bool> TryAcquireLockAsync(string assetPath, string ownerId, string ownerName, string reason = "", long ttlMs = 0)
+        public async Task<bool> TryAcquireLockAsync(string assetPath, string ownerId, string ownerName, string reason = "", long ttlMs = 0, string scopeAssetPath = "")
         {
             await Task.Yield();
 
@@ -868,8 +870,12 @@ namespace Ignoranz.CollabSync
                 CollabSyncGitUtility.TryCaptureCurrentLockSnapshot(out gitSnapshot);
             if (MutateDocument(doc =>
             {
+                assetPath = (assetPath ?? "").Replace('\\', '/');
                 ownerId = CollabIdentityUtility.Normalize(ownerId);
                 ownerName = CollabIdentityUtility.Normalize(ownerName);
+                scopeAssetPath = (scopeAssetPath ?? "").Replace('\\', '/');
+                if (string.IsNullOrEmpty(scopeAssetPath) && !string.IsNullOrEmpty(assetPath))
+                    scopeAssetPath = assetPath;
                 if (IsBlockedUser(doc, ownerId, ownerName))
                     return false;
                 EnsureAdminBootstrap(doc, ownerId, ownerName);
@@ -890,6 +896,7 @@ namespace Ignoranz.CollabSync
                     var lockItem = new LockItem
                     {
                         assetPath = assetPath,
+                        scopeAssetPath = scopeAssetPath,
                         ownerId = ownerId,
                         owner = ownerName,
                         reason = reason,
@@ -913,6 +920,8 @@ namespace Ignoranz.CollabSync
 
                     existing.ownerId = ownerId;
                     existing.owner = ownerName;
+                    if (!string.IsNullOrEmpty(scopeAssetPath))
+                        existing.scopeAssetPath = scopeAssetPath;
                     existing.reason = reason;
                     existing.createdAt = now;
                     existing.ttlMs = ttlMs;

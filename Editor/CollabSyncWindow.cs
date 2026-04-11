@@ -1717,7 +1717,7 @@ public class CollabSyncWindow : EditorWindow
         if (_backend == null || string.IsNullOrEmpty(selection.preferredLockKey))
             return;
 
-        await _backend.TryAcquireLockAsync(selection.preferredLockKey, CurrentUserId, CurrentUserName, "window-selection", 0);
+        await _backend.TryAcquireLockAsync(selection.preferredLockKey, CurrentUserId, CurrentUserName, "window-selection", 0, selection.assetPath);
         RefreshSnapshotAsync();
     }
 
@@ -2402,6 +2402,7 @@ public class CollabSyncWindow : EditorWindow
             lockItem.ownerId ??= "";
             lockItem.owner ??= "";
             lockItem.assetPath ??= "";
+            lockItem.scopeAssetPath ??= "";
             lockItem.reason ??= "";
         }
 
@@ -2833,7 +2834,17 @@ public class CollabSyncWindow : EditorWindow
             return false;
 
         if (lockItem.assetPath.StartsWith("obj:", StringComparison.Ordinal))
-            return false;
+        {
+            var scopePath = CollabSyncEditorLockUtility.GetLockScopeAssetPath(lockItem);
+            if (selection.isFolder)
+            {
+                var prefix = selection.assetPath.TrimEnd('/') + "/";
+                return string.Equals(scopePath, selection.assetPath, StringComparison.Ordinal)
+                    || scopePath.StartsWith(prefix, StringComparison.Ordinal);
+            }
+
+            return string.Equals(scopePath, selection.assetPath, StringComparison.Ordinal);
+        }
 
         if (selection.isFolder)
         {
@@ -3062,7 +3073,7 @@ public class CollabSyncWindow : EditorWindow
             return L("(unknown target)", "（不明な対象）");
 
         if (assetPath.StartsWith("obj:", StringComparison.Ordinal))
-            return L("Scene Object Lock", "シーンオブジェクトのロック");
+            return L("Scene/Prefab Object Lock", "シーン/Prefab オブジェクトロック");
 
         return TruncateMiddle(assetPath, IsCompactLayout(620f) ? 52 : 84);
     }

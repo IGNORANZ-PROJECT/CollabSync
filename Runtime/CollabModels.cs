@@ -34,6 +34,7 @@ namespace Ignoranz.CollabSync
     public class LockItem
     {
         public string assetPath;  // プロジェクト相対
+        public string scopeAssetPath; // object lock の親 scene/prefab, asset/folder lock の対象パス
         public string ownerId;    // Persistent user ID
         public string owner;      // CollabSyncUser.UserName
         public string reason;

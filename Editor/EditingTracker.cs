@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
 using UnityEditor;
 using UnityEditor.Callbacks;
@@ -26,6 +27,8 @@ public static class EditingTracker
 
     sealed class TrackedPropertyChange
     {
+        public string targetObjectKey = "";
+        public string propertyPath = "";
         public string baselineSignature = "";
     }
 
@@ -61,6 +64,8 @@ public static class EditingTracker
     static readonly Dictionary<string, AutoLockState> _autoLockStates = new(StringComparer.Ordinal);
     static readonly Dictionary<string, long> _suppressedAutoLockActivityIds = new(StringComparer.Ordinal);
     static long _nextAutoLockActivityId;
+    static string _lastHierarchyScopePath = "";
+    static string _lastHierarchySignature = "";
     static readonly object _lastPresenceLock = new();
     static EditingPresence _lastPublishedPresence;
 
@@ -69,14 +74,28 @@ public static class EditingTracker
         try
         {
             EditorApplication.update += OnUpdate;
-            EditorSceneManager.activeSceneChangedInEditMode += (_, __) => SafeDetectAll("sceneChanged");
+            EditorSceneManager.activeSceneChangedInEditMode += (_, __) =>
+            {
+                RefreshHierarchyScopeSnapshot();
+                SafeDetectAll("sceneChanged");
+            };
             EditorSceneManager.sceneDirtied += _ => SafeDetectAll("sceneDirtied");
             Selection.selectionChanged += () => SafeDetectAll("selectionChanged");
-            PrefabStage.prefabStageOpened  += _ => SafeDetectAll("prefabOpened");
-            PrefabStage.prefabStageClosing += _ => SafeDetectAll("prefabClosing");
+            PrefabStage.prefabStageOpened += _ =>
+            {
+                RefreshHierarchyScopeSnapshot();
+                SafeDetectAll("prefabOpened");
+            };
+            PrefabStage.prefabStageClosing += _ =>
+            {
+                RefreshHierarchyScopeSnapshot();
+                SafeDetectAll("prefabClosing");
+            };
+            EditorApplication.hierarchyChanged += OnHierarchyChanged;
             Undo.postprocessModifications += OnPostprocessModifications;
 
             SafeDetectAll("init");
+            RefreshHierarchyScopeSnapshot();
             _nextBeatAt = EditorApplication.timeSinceStartup + HEARTBEAT_SEC;
             _nextGitHeadCheckAt = EditorApplication.timeSinceStartup + GIT_HEAD_CHECK_SEC;
         }
@@ -150,14 +169,6 @@ public static class EditingTracker
             return false;
 
         _openedScriptAssetPath = assetPath;
-        RegisterAutoLockTarget(
-            Path.GetFileNameWithoutExtension(assetPath),
-            assetPath,
-            assetPath,
-            CollabSyncLocalization.T("Script", "スクリプト"),
-            SCRIPT_OPEN_KEEP_ALIVE_SEC,
-            requiresDirtyState: false,
-            isFreshActivity: true);
         SafeDetectAll("scriptOpened");
         return false;
     }
@@ -422,6 +433,129 @@ public static class EditingTracker
         return modifications;
     }
 
+    static void OnHierarchyChanged()
+    {
+        try
+        {
+            if (!TryGetCurrentHierarchyScope(out var displayName, out var assetPath, out var context))
+            {
+                _lastHierarchyScopePath = "";
+                _lastHierarchySignature = "";
+                return;
+            }
+
+            var signature = BuildCurrentHierarchySignature(assetPath);
+            if (!string.Equals(_lastHierarchyScopePath, assetPath, StringComparison.Ordinal))
+            {
+                _lastHierarchyScopePath = assetPath;
+                _lastHierarchySignature = signature;
+                return;
+            }
+
+            if (string.Equals(_lastHierarchySignature, signature, StringComparison.Ordinal))
+                return;
+
+            _lastHierarchySignature = signature;
+            RegisterAutoLockTarget(
+                displayName,
+                assetPath,
+                assetPath,
+                context,
+                TRANSIENT_AUTO_LOCK_KEEP_ALIVE_SEC,
+                requiresDirtyState: true,
+                isFreshActivity: true);
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[CollabSync] Hierarchy tracking error: {e}");
+        }
+    }
+
+    static void RefreshHierarchyScopeSnapshot()
+    {
+        try
+        {
+            if (!TryGetCurrentHierarchyScope(out _, out var assetPath, out _))
+            {
+                _lastHierarchyScopePath = "";
+                _lastHierarchySignature = "";
+                return;
+            }
+
+            _lastHierarchyScopePath = assetPath;
+            _lastHierarchySignature = BuildCurrentHierarchySignature(assetPath);
+        }
+        catch
+        {
+            _lastHierarchyScopePath = "";
+            _lastHierarchySignature = "";
+        }
+    }
+
+    static bool TryGetCurrentHierarchyScope(out string displayName, out string assetPath, out string context)
+    {
+        displayName = "";
+        assetPath = "";
+        context = "";
+
+        var stage = PrefabStageUtility.GetCurrentPrefabStage();
+        if (stage != null && !string.IsNullOrEmpty(stage.assetPath))
+        {
+            displayName = Path.GetFileNameWithoutExtension(stage.assetPath);
+            assetPath = stage.assetPath;
+            context = CollabSyncLocalization.T("Prefab Structure", "Prefab 構造");
+            return true;
+        }
+
+        var scene = EditorSceneManager.GetActiveScene();
+        if (scene.IsValid() && !string.IsNullOrEmpty(scene.path))
+        {
+            displayName = Path.GetFileNameWithoutExtension(scene.path);
+            assetPath = scene.path;
+            context = CollabSyncLocalization.T("Scene Structure", "シーン構造");
+            return true;
+        }
+
+        return false;
+    }
+
+    static string BuildCurrentHierarchySignature(string assetPath)
+    {
+        var builder = new StringBuilder(2048);
+        var stage = PrefabStageUtility.GetCurrentPrefabStage();
+        if (stage != null && string.Equals(stage.assetPath, assetPath, StringComparison.Ordinal) && stage.scene.IsValid())
+        {
+            foreach (var root in stage.scene.GetRootGameObjects())
+                AppendHierarchySignature(builder, root.transform);
+            return builder.ToString();
+        }
+
+        var scene = EditorSceneManager.GetActiveScene();
+        if (scene.IsValid() && string.Equals(scene.path, assetPath, StringComparison.Ordinal))
+        {
+            foreach (var root in scene.GetRootGameObjects())
+                AppendHierarchySignature(builder, root.transform);
+        }
+
+        return builder.ToString();
+    }
+
+    static void AppendHierarchySignature(StringBuilder builder, Transform transform)
+    {
+        if (builder == null || transform == null)
+            return;
+
+        builder.Append(GetTrackedUnityObjectKey(transform.gameObject))
+            .Append('|')
+            .Append(transform.parent != null ? GetTrackedUnityObjectKey(transform.parent.gameObject) : "root")
+            .Append('|')
+            .Append(transform.GetSiblingIndex())
+            .AppendLine();
+
+        for (int i = 0; i < transform.childCount; i++)
+            AppendHierarchySignature(builder, transform.GetChild(i));
+    }
+
     static bool TryBuildTransientTargetFromObject(UnityEngine.Object target, out string displayName, out string assetPath, out string lockKey, out string context)
     {
         displayName = "";
@@ -552,8 +686,13 @@ public static class EditingTracker
         var currentSignature = GetTrackedPropertyValueSignature(currentValue);
         if (!state.trackedChanges.TryGetValue(propertyKey, out var trackedChange))
         {
+            var targetObjectKey = GetTrackedUnityObjectKey(currentValue.target);
+            if (string.IsNullOrEmpty(targetObjectKey))
+                targetObjectKey = GetTrackedUnityObjectKey(previousValue.target);
             trackedChange = new TrackedPropertyChange
             {
+                targetObjectKey = targetObjectKey,
+                propertyPath = currentValue.propertyPath ?? previousValue.propertyPath ?? "",
                 baselineSignature = GetTrackedPropertyValueSignature(previousValue)
             };
         }
@@ -751,10 +890,20 @@ public static class EditingTracker
         if (state == null || string.IsNullOrEmpty(state.assetPath))
             return false;
 
+        RefreshTrackedPropertyChanges(state);
         if (state.trackedChanges.Count > 0)
-            return true;
+        {
+            if (CollabSyncGitUtility.IsPathModifiedInWorkingTree(state.assetPath))
+                return true;
 
-        if (state.lockKey.StartsWith("obj:", StringComparison.Ordinal))
+            if (IsSceneOrPrefabDirty(state.assetPath))
+                return true;
+
+            var asset = AssetDatabase.LoadMainAssetAtPath(state.assetPath);
+            return asset != null && EditorUtility.IsDirty(asset);
+        }
+
+        if (CollabSyncEditorLockUtility.IsObjectLockKey(state.lockKey))
             return false;
 
         if (CollabSyncGitUtility.IsPathModifiedInWorkingTree(state.assetPath))
@@ -768,6 +917,131 @@ public static class EditingTracker
 
         var asset = AssetDatabase.LoadMainAssetAtPath(state.assetPath);
         return asset != null && EditorUtility.IsDirty(asset);
+    }
+
+    static void RefreshTrackedPropertyChanges(AutoLockState state)
+    {
+        if (state == null || state.trackedChanges.Count == 0)
+            return;
+
+        var removeKeys = new List<string>();
+        foreach (var pair in state.trackedChanges)
+        {
+            var change = pair.Value;
+            if (change == null)
+            {
+                removeKeys.Add(pair.Key);
+                continue;
+            }
+
+            if (!TryGetCurrentTrackedPropertySignature(change, out var currentSignature))
+                continue;
+
+            if (string.Equals(change.baselineSignature, currentSignature, StringComparison.Ordinal))
+                removeKeys.Add(pair.Key);
+        }
+
+        foreach (var key in removeKeys)
+            state.trackedChanges.Remove(key);
+    }
+
+    static bool TryGetCurrentTrackedPropertySignature(TrackedPropertyChange change, out string signature)
+    {
+        signature = "";
+        if (change == null
+            || string.IsNullOrEmpty(change.targetObjectKey)
+            || string.IsNullOrEmpty(change.propertyPath))
+        {
+            return false;
+        }
+
+        var target = ResolveTrackedUnityObject(change.targetObjectKey);
+        if (target == null)
+            return false;
+
+        try
+        {
+            using var serializedObject = new SerializedObject(target);
+            var property = serializedObject.FindProperty(change.propertyPath);
+            if (property == null)
+                return false;
+
+            signature = BuildSerializedPropertySignature(property);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    static UnityEngine.Object ResolveTrackedUnityObject(string targetObjectKey)
+    {
+        if (string.IsNullOrEmpty(targetObjectKey))
+            return null;
+
+        if (targetObjectKey.StartsWith("asset:", StringComparison.Ordinal))
+            return AssetDatabase.LoadMainAssetAtPath(targetObjectKey.Substring("asset:".Length));
+
+        if (GlobalObjectId.TryParse(targetObjectKey, out var globalId))
+            return GlobalObjectId.GlobalObjectIdentifierToObjectSlow(globalId);
+
+        return null;
+    }
+
+    static string BuildSerializedPropertySignature(SerializedProperty property)
+    {
+        if (property == null)
+            return "";
+
+        switch (property.propertyType)
+        {
+            case SerializedPropertyType.Integer:
+            case SerializedPropertyType.LayerMask:
+            case SerializedPropertyType.Character:
+                return "i|" + property.intValue;
+            case SerializedPropertyType.Boolean:
+                return "b|" + (property.boolValue ? "1" : "0");
+            case SerializedPropertyType.Float:
+                return "f|" + property.floatValue.ToString("R");
+            case SerializedPropertyType.String:
+                return "s|" + (property.stringValue ?? "");
+            case SerializedPropertyType.Color:
+                return "c|" + property.colorValue;
+            case SerializedPropertyType.ObjectReference:
+                return "o|" + GetTrackedUnityObjectKey(property.objectReferenceValue);
+            case SerializedPropertyType.Enum:
+                return "e|" + property.enumValueIndex;
+            case SerializedPropertyType.Vector2:
+                return "v2|" + property.vector2Value;
+            case SerializedPropertyType.Vector3:
+                return "v3|" + property.vector3Value;
+            case SerializedPropertyType.Vector4:
+                return "v4|" + property.vector4Value;
+            case SerializedPropertyType.Rect:
+                return "r|" + property.rectValue;
+            case SerializedPropertyType.Bounds:
+                return "bo|" + property.boundsValue;
+            case SerializedPropertyType.Quaternion:
+                return "q|" + property.quaternionValue;
+            case SerializedPropertyType.Vector2Int:
+                return "v2i|" + property.vector2IntValue;
+            case SerializedPropertyType.Vector3Int:
+                return "v3i|" + property.vector3IntValue;
+            case SerializedPropertyType.RectInt:
+                return "ri|" + property.rectIntValue;
+            case SerializedPropertyType.BoundsInt:
+                return "bi|" + property.boundsIntValue;
+            default:
+                try
+                {
+                    return property.propertyType + "|" + (property.boxedValue?.ToString() ?? "");
+                }
+                catch
+                {
+                    return property.propertyType + "|" + property.propertyPath;
+                }
+        }
     }
 
     static bool IsSceneOrPrefabDirty(string assetPath)
@@ -811,7 +1085,7 @@ public static class EditingTracker
             .ToList();
 
         foreach (var state in desiredStates)
-            await _backend.TryAcquireLockAsync(state.lockKey, meId, meName, "auto-lock", AUTO_LOCK_TTL_MS);
+            await _backend.TryAcquireLockAsync(state.lockKey, meId, meName, "auto-lock", AUTO_LOCK_TTL_MS, state.assetPath);
 
         var desiredKeys = new HashSet<string>(desiredStates.Select(state => state.lockKey), StringComparer.Ordinal);
         var doc = await _backend.LoadOnceAsync() ?? new CollabStateDocument();
