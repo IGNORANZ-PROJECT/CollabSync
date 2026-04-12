@@ -81,6 +81,7 @@ public static class EditingTracker
             };
             EditorSceneManager.sceneDirtied += _ => SafeDetectAll("sceneDirtied");
             Selection.selectionChanged += () => SafeDetectAll("selectionChanged");
+            EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
             PrefabStage.prefabStageOpened += _ =>
             {
                 RefreshHierarchyScopeSnapshot();
@@ -160,9 +161,44 @@ public static class EditingTracker
         }
     }
 
+    static bool IsPlayModeAutoLockSuppressed()
+    {
+        return EditorApplication.isPlayingOrWillChangePlaymode || EditorApplication.isPlaying;
+    }
+
+    static void OnPlayModeStateChanged(PlayModeStateChange change)
+    {
+        try
+        {
+            switch (change)
+            {
+                case PlayModeStateChange.ExitingEditMode:
+                case PlayModeStateChange.EnteredPlayMode:
+                    _openedScriptAssetPath = "";
+                    ClearAutoLockTracking();
+                    SetTarget("", "", "", "", false);
+                    if (_backend != null)
+                        _ = SafeSendBeat("", "");
+                    break;
+
+                case PlayModeStateChange.EnteredEditMode:
+                    RefreshHierarchyScopeSnapshot();
+                    SafeDetectAll("enteredEditMode");
+                    break;
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[CollabSync] Play mode tracking error: {e}");
+        }
+    }
+
     [OnOpenAsset(0)]
     static bool OnOpenAsset(int instanceID, int line)
     {
+        if (IsPlayModeAutoLockSuppressed())
+            return false;
+
         var obj = EditorUtility.InstanceIDToObject(instanceID);
         var assetPath = AssetDatabase.GetAssetPath(obj);
         if (!IsScriptAssetPath(assetPath))
@@ -181,6 +217,13 @@ public static class EditingTracker
 
     static void DetectAll(string reason)
     {
+        if (IsPlayModeAutoLockSuppressed())
+        {
+            ClearAutoLockTracking();
+            SetTarget("", "", "", "", false);
+            return;
+        }
+
         if (CollabSyncEditorLockUtility.TryGetCurrentLockTarget(out var target))
         {
             ApplyScriptAutoLockHeuristics(target);
@@ -226,6 +269,9 @@ public static class EditingTracker
     {
         try
         {
+            if (IsPlayModeAutoLockSuppressed())
+                return;
+
             foreach (var importedPath in importedAssets ?? Array.Empty<string>())
             {
                 if (!string.IsNullOrEmpty(GetPushRecommendationKey(importedPath, "")))
@@ -404,6 +450,9 @@ public static class EditingTracker
     {
         try
         {
+            if (IsPlayModeAutoLockSuppressed())
+                return modifications;
+
             if (modifications == null)
                 return modifications;
 
@@ -437,6 +486,13 @@ public static class EditingTracker
     {
         try
         {
+            if (IsPlayModeAutoLockSuppressed())
+            {
+                _lastHierarchyScopePath = "";
+                _lastHierarchySignature = "";
+                return;
+            }
+
             if (!TryGetCurrentHierarchyScope(out var displayName, out var assetPath, out var context))
             {
                 _lastHierarchyScopePath = "";
@@ -668,6 +724,12 @@ public static class EditingTracker
             _suppressedAutoLockActivityIds.Remove(lockKey);
 
         MaybeWarnPushRecommended(assetPath, context, displayName);
+    }
+
+    static void ClearAutoLockTracking()
+    {
+        _autoLockStates.Clear();
+        _suppressedAutoLockActivityIds.Clear();
     }
 
     static void TrackPropertyModification(string lockKey, PropertyModification previousValue, PropertyModification currentValue)
