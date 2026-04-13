@@ -1248,6 +1248,37 @@ public class CollabSyncWindow : EditorWindow
               "全員が同じ共有 JSON ファイルを指定してください。既存ファイルは「選択...」、新規作成は「新規...」を使います。バックアップ整理と共有ファイル自体の競合回避は CollabSync が自動で処理します。"),
             MessageType.Info);
 
+        var protectSharedStateToggleContent = new GUIContent(
+            L("Encrypt shared state file", "共有状態ファイルを暗号化"),
+            L(
+                "When enabled, the shared state file is stored in protected format. When disabled, it is written as plain JSON.",
+                "有効にすると共有状態ファイルは保護形式で保存されます。無効にすると平文 JSON として保存されます。"));
+        var canEditSharedStateProtection = CanEditSharedStateProtectionSetting();
+        using (new EditorGUI.DisabledScope(!canEditSharedStateProtection))
+        {
+            var nextProtectSharedStateFile = EditorGUILayout.ToggleLeft(protectSharedStateToggleContent, _cfg.protectSharedStateFile);
+            if (_cfg != null && nextProtectSharedStateFile != _cfg.protectSharedStateFile)
+                ApplySharedStateProtectionSelection(nextProtectSharedStateFile);
+        }
+
+        if (!canEditSharedStateProtection)
+        {
+            EditorGUILayout.HelpBox(
+                L("Only the Root Admin can change shared state file encryption.",
+                  "共有状態ファイルの暗号化を切り替えられるのは Root管理者のみです。"),
+                MessageType.Info);
+        }
+
+        EditorGUILayout.HelpBox(
+            _cfg != null && _cfg.protectSharedStateFile
+                ? L(
+                    "ON: The shared state file is encrypted and tamper-detected. Direct text editing is not expected to work.",
+                    "ON: 共有状態ファイルは暗号化と改ざん検知付きで保存されます。テキスト直接編集は前提にしていません。")
+                : L(
+                    "OFF: The shared state file is stored as plain JSON. This is easier to inspect manually, but direct editing can break synchronization.",
+                    "OFF: 共有状態ファイルは平文 JSON で保存されます。中身は見やすくなりますが、直接編集で同期を壊しやすくなります。"),
+            _cfg != null && _cfg.protectSharedStateFile ? MessageType.Info : MessageType.Warning);
+
         EditorGUILayout.Space(8);
         EditorGUILayout.LabelField(L("Resolved Local JSON", "解決後の JSON パス"), EditorStyles.boldLabel);
         var ok = _cfg.TryGetResolvedJsonPath(out var resolvedPath, out var statusOrError);
@@ -2343,6 +2374,31 @@ public class CollabSyncWindow : EditorWindow
         CollabSyncConfig.SetEditorLocalJsonPath(_cfg, chosenPath);
         BuildBackendSafe();
         Repaint();
+    }
+
+    private void ApplySharedStateProtectionSelection(bool enabled)
+    {
+        if (_cfg == null)
+            return;
+        if (!CanEditSharedStateProtectionSetting())
+            return;
+
+        _cfg.protectSharedStateFile = enabled;
+        _cfg.sharedStateProtectionInitialized = true;
+        CollabSyncConfig.SaveEditorAsset(_cfg);
+        BuildBackendSafe();
+        RefreshSnapshotAsync();
+        Repaint();
+        ShowNotification(new GUIContent(
+            enabled
+                ? L("Shared state file protection enabled.", "共有状態ファイルの暗号化を有効にしました。")
+                : L("Shared state file protection disabled.", "共有状態ファイルの暗号化を無効にしました。")));
+    }
+
+    private bool CanEditSharedStateProtectionSetting()
+    {
+        return IsCurrentUserRootAdmin()
+            || (string.IsNullOrEmpty(GetRootAdminUserId()) && string.IsNullOrEmpty(GetRootAdminUserName()));
     }
 
     private void NormalizeStoredJsonPathIfNeeded()

@@ -30,7 +30,9 @@ namespace Ignoranz.CollabSync
 
             lock (s_backendLock)
             {
-                var backendKey = resolvedPath + "\n" + CollabSyncProtectedStateUtility.NormalizeProjectId(cfg.projectId);
+                var backendKey = resolvedPath + "\n"
+                    + CollabSyncProtectedStateUtility.NormalizeProjectId(cfg.projectId) + "\n"
+                    + (cfg.protectSharedStateFile ? "protected" : "plain");
                 if (s_cachedBackend != null && string.Equals(s_cachedBackendKey, backendKey, StringComparison.Ordinal))
                 {
                     backend = s_cachedBackend;
@@ -42,7 +44,7 @@ namespace Ignoranz.CollabSync
                     disposable.Dispose();
 
                 s_cachedBackendKey = backendKey;
-                s_cachedBackend = new LocalJsonBackend(resolvedPath, cfg.projectId);
+                s_cachedBackend = new LocalJsonBackend(resolvedPath, cfg.projectId, cfg.protectSharedStateFile);
                 backend = s_cachedBackend;
             }
 
@@ -239,6 +241,13 @@ namespace Ignoranz.CollabSync
         public static string ProtectSharedStateJson(string plainJson, string projectId)
         {
             return ProtectString(plainJson, SharedStatePurpose, BuildSharedStateSeed(projectId));
+        }
+
+        public static string EncodeSharedStateStorageText(string plainJson, string projectId, bool protectSharedStateFile)
+        {
+            return protectSharedStateFile
+                ? ProtectSharedStateJson(plainJson, projectId)
+                : (plainJson ?? "");
         }
 
         public static bool TryReadSharedStateJson(string storageText, string projectId, out string plainJson, out bool wasProtected)

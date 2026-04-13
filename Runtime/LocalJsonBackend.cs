@@ -17,41 +17,119 @@ namespace Ignoranz.CollabSync
         const int MaxHistoryItems = 160;
         const long HistoryDuplicateWindowMs = 3000;
         static readonly TimeSpan BackupMinInterval = TimeSpan.FromMinutes(15);
+        const string ShardManifestFormat = "collabsync-shard-store-v1";
 
         readonly string _path;
         readonly string _projectId;
+        readonly bool _protectSharedStateFile;
+        readonly string _storeDirectory;
+        readonly string _storeManifestPath;
         readonly string _backupDirectory;
         readonly string _backupPrefix;
+        readonly object _mutationLock = new();
         FileSystemWatcher _watcher;
         Action<CollabStateDocument> _onUpdate;
         bool _disposed;
         int _raiseVersion;
         long _lastRaisedUpdatedAt = long.MinValue;
 
-        public LocalJsonBackend(string jsonPath, string projectId = "")
+        [Serializable]
+        sealed class ShardStoreManifest
+        {
+            public string format = ShardManifestFormat;
+            public string storeDirectoryName = "";
+            public bool protectSharedStateFile = true;
+            public long updatedAt;
+        }
+
+        [Serializable]
+        sealed class SharedStateRecord
+        {
+            public string rootAdminUserId = "";
+            public string rootAdminUser = "";
+            public string workHistoryMode = "enabled";
+            public long updatedAt;
+        }
+
+        [Serializable]
+        sealed class IdentityRecord
+        {
+            public string userId = "";
+            public string userName = "";
+            public long updatedAt;
+            public bool deleted;
+        }
+
+        [Serializable]
+        sealed class PresenceRecord
+        {
+            public EditingPresence presence = new();
+            public long updatedAt;
+            public bool deleted;
+        }
+
+        [Serializable]
+        sealed class LockRecord
+        {
+            public LockItem item = new();
+            public long updatedAt;
+            public bool deleted;
+        }
+
+        [Serializable]
+        sealed class MemoRecord
+        {
+            public MemoItem item = new();
+            public long updatedAt;
+            public bool deleted;
+        }
+
+        [Serializable]
+        sealed class MemoReadRecord
+        {
+            public string memoId = "";
+            public string userId = "";
+            public string userName = "";
+            public long updatedAt;
+            public bool deleted;
+        }
+
+        [Serializable]
+        sealed class HistoryRecord
+        {
+            public WorkHistoryItem item = new();
+            public long updatedAt;
+        }
+
+        public LocalJsonBackend(string jsonPath, string projectId = "", bool protectSharedStateFile = true)
         {
             _path = string.IsNullOrWhiteSpace(jsonPath)
                 ? CollabSyncBackendUtility.DefaultLocalJsonPath
                 : jsonPath;
             _projectId = CollabSyncProtectedStateUtility.NormalizeProjectId(projectId);
+            _protectSharedStateFile = protectSharedStateFile;
 
             var dir = Path.GetDirectoryName(_path);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            _storeDirectory = Path.Combine(dir ?? ".", Path.GetFileNameWithoutExtension(_path) + ".collabsync-store");
+            _storeManifestPath = _path;
 
             _backupDirectory = Path.Combine(dir ?? ".", ".collabsync-backups");
             _backupPrefix = Path.GetFileNameWithoutExtension(_path) + "-";
 
             EnsureJsonFileExists();
-            UpgradeLegacyPlaintextFileIfNeeded();
+            EnsureStorageProtectionMode();
 
             try
             {
-                _watcher = new FileSystemWatcher(Path.GetDirectoryName(_path) ?? ".", Path.GetFileName(_path))
+                _watcher = new FileSystemWatcher(Path.GetDirectoryName(_path) ?? ".", "*")
                 {
-                    NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName
+                    NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName | NotifyFilters.DirectoryName,
+                    IncludeSubdirectories = true
                 };
                 _watcher.Changed += (_, __) => RequestRaise();
                 _watcher.Created += (_, __) => RequestRaise();
+                _watcher.Deleted += (_, __) => RequestRaise();
                 _watcher.Renamed += (_, __) => RequestRaise();
                 _watcher.EnableRaisingEvents = true;
             }
@@ -66,6 +144,15 @@ namespace Ignoranz.CollabSync
 #else
             UnityEngine.JsonUtility.ToJson(doc);
 #endif
+
+        static string ToJsonObject<T>(T value)
+        {
+#if UNITY_2021_2_OR_NEWER
+            return UnityEngine.JsonUtility.ToJson(value, true);
+#else
+            return UnityEngine.JsonUtility.ToJson(value);
+#endif
+        }
 
         static void Normalize(CollabStateDocument doc)
         {
@@ -181,6 +268,20 @@ namespace Ignoranz.CollabSync
             catch
             {
                 doc = null;
+                return false;
+            }
+        }
+
+        static bool TryParsePlainJsonObject<T>(string text, out T value) where T : class
+        {
+            try
+            {
+                value = UnityEngine.JsonUtility.FromJson<T>(text);
+                return value != null;
+            }
+            catch
+            {
+                value = null;
                 return false;
             }
         }
@@ -368,76 +469,278 @@ namespace Ignoranz.CollabSync
 
         void EnsureJsonFileExists()
         {
-            if (File.Exists(_path)) return;
-
-            var init = new CollabStateDocument { updatedAt = TimeUtil.NowMs() };
-            File.WriteAllText(_path, ToStorageText(init), Encoding.UTF8);
+            EnsureStoreReady();
         }
 
-        void UpgradeLegacyPlaintextFileIfNeeded()
+        void EnsureStorageProtectionMode()
         {
-            if (!TryOpenFile(FileAccess.ReadWrite, FileShare.None, out var stream))
+            EnsureStoreReady();
+            RewriteStoreProtectionIfNeeded();
+        }
+
+        void EnsureStoreReady()
+        {
+            var parentDir = Path.GetDirectoryName(_path);
+            if (!string.IsNullOrEmpty(parentDir))
+                Directory.CreateDirectory(parentDir);
+
+            Directory.CreateDirectory(_storeDirectory);
+            EnsureCategoryDirectories();
+
+            if (TryReadStoreManifest(out _))
+            {
+                WriteStoreManifest();
+                return;
+            }
+
+            if (StoreHasShardData())
+            {
+                WriteStoreManifest();
+                return;
+            }
+
+            if (File.Exists(_path))
+            {
+                var existingText = SafeReadAllText(_path);
+                if (!TryReadStoreManifest(existingText, out _) &&
+                    TryParseDoc(existingText, out var legacyDoc))
+                {
+                    Normalize(legacyDoc);
+                    if (legacyDoc.updatedAt <= 0)
+                        legacyDoc.updatedAt = TimeUtil.NowMs();
+                    WriteDocDelta(new CollabStateDocument(), legacyDoc);
+                    if (!string.IsNullOrWhiteSpace(existingText))
+                        WriteBackup(ToJson(legacyDoc));
+                }
+            }
+
+            WriteStoreManifest();
+        }
+
+        void EnsureCategoryDirectories()
+        {
+            Directory.CreateDirectory(GetCategoryDirectory("state"));
+            Directory.CreateDirectory(GetCategoryDirectory("presences"));
+            Directory.CreateDirectory(GetCategoryDirectory("locks"));
+            Directory.CreateDirectory(GetCategoryDirectory("memos"));
+            Directory.CreateDirectory(GetCategoryDirectory("memo-reads"));
+            Directory.CreateDirectory(GetCategoryDirectory("admins"));
+            Directory.CreateDirectory(GetCategoryDirectory("blocked"));
+            Directory.CreateDirectory(GetCategoryDirectory("history"));
+        }
+
+        void RewriteStoreProtectionIfNeeded()
+        {
+            if (!Directory.Exists(_storeDirectory))
                 return;
 
-            using (stream)
+            foreach (var file in Directory.GetFiles(_storeDirectory, "*.json", SearchOption.AllDirectories))
             {
-                var currentText = ReadText(stream);
-                if (CollabSyncProtectedStateUtility.IsProtectedPayload(currentText))
-                    return;
-                if (!TryParsePlainJsonDoc(currentText, out var doc))
-                    return;
+                var currentText = SafeReadAllText(file);
+                if (!TryDecodeStorageText(currentText, out var jsonText))
+                    continue;
 
-                if (!string.IsNullOrWhiteSpace(currentText))
-                    WriteBackup(currentText);
+                var isProtected = CollabSyncProtectedStateUtility.IsProtectedPayload(currentText);
+                if (isProtected == _protectSharedStateFile && !string.IsNullOrWhiteSpace(currentText))
+                    continue;
 
-                WriteText(stream, ToStorageText(doc));
-            }
-        }
-
-        string ToStorageText(CollabStateDocument doc)
-        {
-            return CollabSyncProtectedStateUtility.ProtectSharedStateJson(ToJson(doc), _projectId);
-        }
-
-        string ReadText(FileStream stream)
-        {
-            stream.Position = 0;
-            using var reader = new StreamReader(stream, Encoding.UTF8, true, 4096, true);
-            return reader.ReadToEnd();
-        }
-
-        void WriteText(FileStream stream, string text)
-        {
-            stream.Position = 0;
-            stream.SetLength(0);
-            using var writer = new StreamWriter(stream, Encoding.UTF8, 4096, true);
-            writer.Write(text);
-            writer.Flush();
-            stream.Flush();
-        }
-
-        bool TryOpenFile(FileAccess access, FileShare share, out FileStream stream)
-        {
-            stream = null;
-
-            for (int attempt = 0; attempt < FileAccessRetryCount; attempt++)
-            {
-                try
-                {
-                    stream = new FileStream(_path, FileMode.OpenOrCreate, access, share);
-                    return true;
-                }
-                catch (IOException)
-                {
-                    Thread.Sleep(FileAccessRetryDelayMs);
-                }
-                catch (UnauthorizedAccessException)
-                {
-                    Thread.Sleep(FileAccessRetryDelayMs);
-                }
+                WriteAtomicText(file, EncodeStorageText(jsonText));
             }
 
+            WriteStoreManifest();
+        }
+
+        string EncodeStorageText(string jsonText)
+        {
+            return CollabSyncProtectedStateUtility.EncodeSharedStateStorageText(jsonText, _projectId, _protectSharedStateFile);
+        }
+
+        bool TryDecodeStorageText(string storageText, out string jsonText)
+        {
+            if (CollabSyncProtectedStateUtility.TryReadSharedStateJson(storageText, _projectId, out jsonText, out _))
+                return true;
+
+            jsonText = null;
             return false;
+        }
+
+        bool TryReadStoreManifest(out ShardStoreManifest manifest)
+        {
+            manifest = null;
+            if (!File.Exists(_storeManifestPath))
+                return false;
+
+            return TryReadStoreManifest(SafeReadAllText(_storeManifestPath), out manifest);
+        }
+
+        bool TryReadStoreManifest(string text, out ShardStoreManifest manifest)
+        {
+            if (!TryParsePlainJsonObject(text, out manifest))
+                return false;
+
+            return manifest != null
+                && string.Equals(manifest.format ?? "", ShardManifestFormat, StringComparison.Ordinal);
+        }
+
+        void WriteStoreManifest()
+        {
+            var manifest = new ShardStoreManifest
+            {
+                format = ShardManifestFormat,
+                storeDirectoryName = Path.GetFileName(_storeDirectory),
+                protectSharedStateFile = _protectSharedStateFile,
+                updatedAt = TimeUtil.NowMs()
+            };
+            WriteAtomicText(_storeManifestPath, ToJsonObject(manifest));
+        }
+
+        string SafeReadAllText(string path)
+        {
+            try
+            {
+                return File.Exists(path) ? File.ReadAllText(path, Encoding.UTF8) : "";
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        void WriteAtomicText(string path, string text)
+        {
+            try
+            {
+                var directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(directory))
+                    Directory.CreateDirectory(directory);
+
+                var tempPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                File.WriteAllText(tempPath, text ?? "", Encoding.UTF8);
+
+                if (File.Exists(path))
+                {
+                    try
+                    {
+                        File.Replace(tempPath, path, null);
+                    }
+                    catch
+                    {
+                        File.Copy(tempPath, path, true);
+                        File.Delete(tempPath);
+                    }
+                }
+                else
+                {
+                    File.Move(tempPath, path);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        string GetCategoryDirectory(string category)
+        {
+            return Path.Combine(_storeDirectory, category);
+        }
+
+        string GetRecordPath(string category, string key)
+        {
+            return Path.Combine(GetCategoryDirectory(category), ComputeRecordFileName(key));
+        }
+
+        static string ComputeRecordFileName(string key)
+        {
+            return UnityEngine.Hash128.Compute(key ?? "").ToString() + ".json";
+        }
+
+        static string BuildIdentityKey(string userId, string userName)
+        {
+            userId = CollabIdentityUtility.Normalize(userId);
+            userName = CollabIdentityUtility.Normalize(userName);
+            if (string.IsNullOrEmpty(userId) && string.IsNullOrEmpty(userName))
+                return "";
+            return !string.IsNullOrEmpty(userId) ? "id:" + userId : "legacy:" + userName;
+        }
+
+        static string GetPresenceIdentityKey(EditingPresence presence)
+        {
+            return presence == null ? "" : BuildIdentityKey(presence.userId, presence.user);
+        }
+
+        static string GetMemoIdentityKey(MemoItem memo)
+        {
+            return memo?.id ?? "";
+        }
+
+        static string GetMemoReadIdentityKey(string memoId, string userId, string userName)
+        {
+            return (memoId ?? "") + "|" + BuildIdentityKey(userId, userName);
+        }
+
+        static string GetLockIdentityKey(LockItem item)
+        {
+            return item?.assetPath ?? "";
+        }
+
+        static string GetWorkHistoryIdentityKey(WorkHistoryItem item)
+        {
+            return item?.id ?? "";
+        }
+
+        static string BuildMemoBodySignature(MemoItem memo)
+        {
+            if (memo == null)
+                return "";
+
+            var comparable = new MemoItem
+            {
+                id = memo.id ?? "",
+                authorId = memo.authorId ?? "",
+                text = memo.text ?? "",
+                author = memo.author ?? "",
+                assetPath = memo.assetPath ?? "",
+                createdAt = memo.createdAt,
+                pinned = memo.pinned
+            };
+            return ToJsonObject(comparable);
+        }
+
+        static MemoItem CloneMemoForStorage(MemoItem memo)
+        {
+            if (memo == null)
+                return new MemoItem();
+
+            return new MemoItem
+            {
+                id = memo.id ?? "",
+                authorId = memo.authorId ?? "",
+                text = memo.text ?? "",
+                author = memo.author ?? "",
+                assetPath = memo.assetPath ?? "",
+                createdAt = memo.createdAt,
+                pinned = memo.pinned,
+                readByUserIds = new List<string>(),
+                readByUsers = new List<string>()
+            };
+        }
+
+        static string BuildIdentitySignature(string userId, string userName)
+        {
+            return (userId ?? "") + "\n" + (userName ?? "");
+        }
+
+        bool StoreHasShardData()
+        {
+            try
+            {
+                return Directory.Exists(_storeDirectory)
+                    && Directory.GetFiles(_storeDirectory, "*.json", SearchOption.AllDirectories).Length > 0;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         CollabStateDocument ReadLatestBackup()
@@ -466,37 +769,483 @@ namespace Ignoranz.CollabSync
         {
             EnsureJsonFileExists();
 
-            if (!TryOpenFile(FileAccess.Read, FileShare.ReadWrite, out var stream))
-                return ReadLatestBackup();
-
-            using (stream)
-            {
-                var text = ReadText(stream);
-                if (TryParseDoc(text, out var currentDoc))
-                    return currentDoc;
-            }
+            if (TryReadDocFromShardStore(out var currentDoc))
+                return currentDoc;
 
             return ReadLatestBackup();
         }
 
-        void CreateBackupIfNeeded(string previousText, bool previousWasValid, CollabStateDocument previousDoc, CollabStateDocument nextDoc)
+        bool TryReadStoreRecord<T>(string path, out T record) where T : class
         {
-            if (string.IsNullOrWhiteSpace(previousText))
+            record = null;
+            var storageText = SafeReadAllText(path);
+            if (string.IsNullOrWhiteSpace(storageText))
+                return false;
+            if (!TryDecodeStorageText(storageText, out var jsonText))
+                return false;
+
+            return TryParsePlainJsonObject(jsonText, out record);
+        }
+
+        IEnumerable<T> ReadAllStoreRecords<T>(string category) where T : class
+        {
+            var directory = GetCategoryDirectory(category);
+            if (!Directory.Exists(directory))
+                yield break;
+
+            string[] files;
+            try
+            {
+                files = Directory.GetFiles(directory, "*.json", SearchOption.TopDirectoryOnly);
+            }
+            catch
+            {
+                yield break;
+            }
+
+            foreach (var file in files)
+            {
+                if (TryReadStoreRecord<T>(file, out var record) && record != null)
+                    yield return record;
+            }
+        }
+
+        IEnumerable<T> ReadLatestStoreRecords<T>(string category, Func<T, string> keySelector, Func<T, long> updatedAtSelector) where T : class
+        {
+            var latestByKey = new Dictionary<string, T>(StringComparer.Ordinal);
+            foreach (var record in ReadAllStoreRecords<T>(category))
+            {
+                var key = keySelector(record) ?? "";
+                if (string.IsNullOrEmpty(key))
+                    continue;
+
+                if (!latestByKey.TryGetValue(key, out var existing) || updatedAtSelector(record) >= updatedAtSelector(existing))
+                    latestByKey[key] = record;
+            }
+
+            return latestByKey.Values;
+        }
+
+        bool TryReadDocFromShardStore(out CollabStateDocument doc)
+        {
+            doc = new CollabStateDocument();
+
+            if (!StoreHasShardData())
+            {
+                Normalize(doc);
+                return true;
+            }
+
+            long latestUpdatedAt = 0;
+
+            if (TryReadStoreRecord<SharedStateRecord>(Path.Combine(GetCategoryDirectory("state"), "shared.json"), out var stateRecord) && stateRecord != null)
+            {
+                doc.rootAdminUserId = stateRecord.rootAdminUserId ?? "";
+                doc.rootAdminUser = stateRecord.rootAdminUser ?? "";
+                doc.workHistoryMode = stateRecord.workHistoryMode ?? "enabled";
+                latestUpdatedAt = Math.Max(latestUpdatedAt, stateRecord.updatedAt);
+            }
+
+            foreach (var adminRecord in ReadLatestStoreRecords<IdentityRecord>("admins",
+                         r => BuildIdentityKey(r.userId, r.userName),
+                         r => r.updatedAt))
+            {
+                if (adminRecord == null || adminRecord.deleted)
+                    continue;
+
+                doc.adminUserIds.Add(adminRecord.userId ?? "");
+                doc.adminUsers.Add(adminRecord.userName ?? "");
+                latestUpdatedAt = Math.Max(latestUpdatedAt, adminRecord.updatedAt);
+            }
+
+            foreach (var blockedRecord in ReadLatestStoreRecords<IdentityRecord>("blocked",
+                         r => BuildIdentityKey(r.userId, r.userName),
+                         r => r.updatedAt))
+            {
+                if (blockedRecord == null || blockedRecord.deleted)
+                    continue;
+
+                doc.blockedUserIds.Add(blockedRecord.userId ?? "");
+                doc.blockedUsers.Add(blockedRecord.userName ?? "");
+                latestUpdatedAt = Math.Max(latestUpdatedAt, blockedRecord.updatedAt);
+            }
+
+            foreach (var presenceRecord in ReadLatestStoreRecords<PresenceRecord>("presences",
+                         r => GetPresenceIdentityKey(r.presence),
+                         r => r.updatedAt))
+            {
+                if (presenceRecord?.presence == null || presenceRecord.deleted)
+                    continue;
+
+                doc.presences.Add(presenceRecord.presence);
+                latestUpdatedAt = Math.Max(latestUpdatedAt, presenceRecord.updatedAt);
+            }
+
+            foreach (var lockRecord in ReadLatestStoreRecords<LockRecord>("locks",
+                         r => GetLockIdentityKey(r.item),
+                         r => r.updatedAt))
+            {
+                if (lockRecord?.item == null || lockRecord.deleted)
+                    continue;
+
+                doc.locks.Add(lockRecord.item);
+                latestUpdatedAt = Math.Max(latestUpdatedAt, lockRecord.updatedAt);
+            }
+
+            var memosById = new Dictionary<string, MemoItem>(StringComparer.Ordinal);
+            foreach (var memoRecord in ReadLatestStoreRecords<MemoRecord>("memos",
+                         r => GetMemoIdentityKey(r.item),
+                         r => r.updatedAt))
+            {
+                if (memoRecord?.item == null || memoRecord.deleted || string.IsNullOrEmpty(memoRecord.item.id))
+                    continue;
+
+                var memo = memoRecord.item;
+                memo.readByUserIds ??= new List<string>();
+                memo.readByUsers ??= new List<string>();
+                memosById[memo.id] = memo;
+                latestUpdatedAt = Math.Max(latestUpdatedAt, memoRecord.updatedAt);
+            }
+
+            foreach (var readRecord in ReadLatestStoreRecords<MemoReadRecord>("memo-reads",
+                         r => GetMemoReadIdentityKey(r.memoId, r.userId, r.userName),
+                         r => r.updatedAt))
+            {
+                if (readRecord == null || readRecord.deleted)
+                    continue;
+                if (!memosById.TryGetValue(readRecord.memoId ?? "", out var memo))
+                    continue;
+
+                CollabIdentityUtility.AddReadMarker(memo, readRecord.userId ?? "", readRecord.userName ?? "");
+                latestUpdatedAt = Math.Max(latestUpdatedAt, readRecord.updatedAt);
+            }
+
+            doc.memos = memosById.Values
+                .OrderByDescending(m => m.pinned)
+                .ThenByDescending(m => m.createdAt)
+                .ToList();
+
+            doc.history = ReadAllStoreRecords<HistoryRecord>("history")
+                .Where(record => record?.item != null && !string.IsNullOrEmpty(record.item.id))
+                .OrderByDescending(record => record.item.createdAt)
+                .ThenByDescending(record => record.updatedAt)
+                .Take(MaxHistoryItems)
+                .Select(record =>
+                {
+                    latestUpdatedAt = Math.Max(latestUpdatedAt, record.updatedAt);
+                    return record.item;
+                })
+                .ToList();
+
+            doc.updatedAt = latestUpdatedAt;
+            Normalize(doc);
+            return true;
+        }
+
+        void WriteStoreRecord<T>(string path, T record) where T : class
+        {
+            if (record == null)
                 return;
 
-            if (!previousWasValid)
+            WriteAtomicText(path, EncodeStorageText(ToJsonObject(record)));
+        }
+
+        void WriteDocDelta(CollabStateDocument previousDoc, CollabStateDocument nextDoc)
+        {
+            EnsureCategoryDirectories();
+            SyncSharedStateRecord(previousDoc, nextDoc);
+            SyncIdentityRecords("admins", previousDoc.adminUserIds, previousDoc.adminUsers, nextDoc.adminUserIds, nextDoc.adminUsers, nextDoc.updatedAt);
+            SyncIdentityRecords("blocked", previousDoc.blockedUserIds, previousDoc.blockedUsers, nextDoc.blockedUserIds, nextDoc.blockedUsers, nextDoc.updatedAt);
+            SyncPresenceRecords(previousDoc.presences, nextDoc.presences, nextDoc.updatedAt);
+            SyncLockRecords(previousDoc.locks, nextDoc.locks, nextDoc.updatedAt);
+            SyncMemoRecords(previousDoc.memos, nextDoc.memos, nextDoc.updatedAt);
+            SyncHistoryRecords(previousDoc.history, nextDoc.history, nextDoc.updatedAt);
+        }
+
+        void SyncSharedStateRecord(CollabStateDocument previousDoc, CollabStateDocument nextDoc)
+        {
+            if (string.Equals(previousDoc.rootAdminUserId ?? "", nextDoc.rootAdminUserId ?? "", StringComparison.Ordinal)
+                && string.Equals(previousDoc.rootAdminUser ?? "", nextDoc.rootAdminUser ?? "", StringComparison.Ordinal)
+                && string.Equals(previousDoc.workHistoryMode ?? "enabled", nextDoc.workHistoryMode ?? "enabled", StringComparison.Ordinal))
             {
-                WriteBackup(previousText);
                 return;
             }
 
+            WriteStoreRecord(
+                Path.Combine(GetCategoryDirectory("state"), "shared.json"),
+                new SharedStateRecord
+                {
+                    rootAdminUserId = nextDoc.rootAdminUserId ?? "",
+                    rootAdminUser = nextDoc.rootAdminUser ?? "",
+                    workHistoryMode = nextDoc.workHistoryMode ?? "enabled",
+                    updatedAt = nextDoc.updatedAt
+                });
+        }
+
+        void SyncIdentityRecords(string category, List<string> previousIds, List<string> previousNames, List<string> nextIds, List<string> nextNames, long updatedAt)
+        {
+            var previous = BuildIdentityDictionary(previousIds, previousNames);
+            var next = BuildIdentityDictionary(nextIds, nextNames);
+
+            foreach (var pair in next)
+            {
+                var nextRecord = pair.Value;
+                if (!previous.TryGetValue(pair.Key, out var previousRecord)
+                    || !string.Equals(BuildIdentitySignature(previousRecord.userId, previousRecord.userName), BuildIdentitySignature(nextRecord.userId, nextRecord.userName), StringComparison.Ordinal))
+                {
+                    nextRecord.updatedAt = updatedAt;
+                    nextRecord.deleted = false;
+                    WriteStoreRecord(GetRecordPath(category, pair.Key), nextRecord);
+                }
+            }
+
+            foreach (var pair in previous)
+            {
+                if (next.ContainsKey(pair.Key))
+                    continue;
+
+                WriteStoreRecord(
+                    GetRecordPath(category, pair.Key),
+                    new IdentityRecord
+                    {
+                        userId = pair.Value.userId ?? "",
+                        userName = pair.Value.userName ?? "",
+                        updatedAt = updatedAt,
+                        deleted = true
+                    });
+            }
+        }
+
+        Dictionary<string, IdentityRecord> BuildIdentityDictionary(List<string> ids, List<string> names)
+        {
+            var result = new Dictionary<string, IdentityRecord>(StringComparer.Ordinal);
+            var count = Math.Max(ids?.Count ?? 0, names?.Count ?? 0);
+            for (int i = 0; i < count; i++)
+            {
+                var userId = i < (ids?.Count ?? 0) ? ids[i] ?? "" : "";
+                var userName = i < (names?.Count ?? 0) ? names[i] ?? "" : "";
+                var key = BuildIdentityKey(userId, userName);
+                if (string.IsNullOrEmpty(key))
+                    continue;
+
+                result[key] = new IdentityRecord
+                {
+                    userId = userId,
+                    userName = userName
+                };
+            }
+
+            return result;
+        }
+
+        void SyncPresenceRecords(List<EditingPresence> previousPresences, List<EditingPresence> nextPresences, long updatedAt)
+        {
+            var previous = (previousPresences ?? new List<EditingPresence>())
+                .Where(p => p != null && !string.IsNullOrEmpty(GetPresenceIdentityKey(p)))
+                .ToDictionary(GetPresenceIdentityKey, p => p, StringComparer.Ordinal);
+            var next = (nextPresences ?? new List<EditingPresence>())
+                .Where(p => p != null && !string.IsNullOrEmpty(GetPresenceIdentityKey(p)))
+                .ToDictionary(GetPresenceIdentityKey, p => p, StringComparer.Ordinal);
+
+            foreach (var pair in next)
+            {
+                if (!previous.TryGetValue(pair.Key, out var previousPresence)
+                    || !string.Equals(ToJsonObject(previousPresence), ToJsonObject(pair.Value), StringComparison.Ordinal))
+                {
+                    WriteStoreRecord(
+                        GetRecordPath("presences", pair.Key),
+                        new PresenceRecord
+                        {
+                            presence = pair.Value,
+                            updatedAt = updatedAt,
+                            deleted = false
+                        });
+                }
+            }
+
+            foreach (var pair in previous)
+            {
+                if (next.ContainsKey(pair.Key))
+                    continue;
+
+                WriteStoreRecord(
+                    GetRecordPath("presences", pair.Key),
+                    new PresenceRecord
+                    {
+                        presence = pair.Value,
+                        updatedAt = updatedAt,
+                        deleted = true
+                    });
+            }
+        }
+
+        void SyncLockRecords(List<LockItem> previousLocks, List<LockItem> nextLocks, long updatedAt)
+        {
+            var previous = (previousLocks ?? new List<LockItem>())
+                .Where(item => item != null && !string.IsNullOrEmpty(GetLockIdentityKey(item)))
+                .ToDictionary(GetLockIdentityKey, item => item, StringComparer.Ordinal);
+            var next = (nextLocks ?? new List<LockItem>())
+                .Where(item => item != null && !string.IsNullOrEmpty(GetLockIdentityKey(item)))
+                .ToDictionary(GetLockIdentityKey, item => item, StringComparer.Ordinal);
+
+            foreach (var pair in next)
+            {
+                if (!previous.TryGetValue(pair.Key, out var previousItem)
+                    || !string.Equals(ToJsonObject(previousItem), ToJsonObject(pair.Value), StringComparison.Ordinal))
+                {
+                    WriteStoreRecord(
+                        GetRecordPath("locks", pair.Key),
+                        new LockRecord
+                        {
+                            item = pair.Value,
+                            updatedAt = updatedAt,
+                            deleted = false
+                        });
+                }
+            }
+
+            foreach (var pair in previous)
+            {
+                if (next.ContainsKey(pair.Key))
+                    continue;
+
+                WriteStoreRecord(
+                    GetRecordPath("locks", pair.Key),
+                    new LockRecord
+                    {
+                        item = pair.Value,
+                        updatedAt = updatedAt,
+                        deleted = true
+                    });
+            }
+        }
+
+        void SyncMemoRecords(List<MemoItem> previousMemos, List<MemoItem> nextMemos, long updatedAt)
+        {
+            var previous = (previousMemos ?? new List<MemoItem>())
+                .Where(m => m != null && !string.IsNullOrEmpty(m.id))
+                .ToDictionary(m => m.id, m => m, StringComparer.Ordinal);
+            var next = (nextMemos ?? new List<MemoItem>())
+                .Where(m => m != null && !string.IsNullOrEmpty(m.id))
+                .ToDictionary(m => m.id, m => m, StringComparer.Ordinal);
+
+            foreach (var pair in next)
+            {
+                if (!previous.TryGetValue(pair.Key, out var previousMemo)
+                    || !string.Equals(BuildMemoBodySignature(previousMemo), BuildMemoBodySignature(pair.Value), StringComparison.Ordinal))
+                {
+                    WriteStoreRecord(
+                        GetRecordPath("memos", pair.Key),
+                        new MemoRecord
+                        {
+                            item = CloneMemoForStorage(pair.Value),
+                            updatedAt = updatedAt,
+                            deleted = false
+                        });
+                }
+
+                var previousReads = new HashSet<string>(
+                    (previousMemo?.readByUserIds ?? new List<string>())
+                        .Select(userId => GetMemoReadIdentityKey(pair.Key, userId, ""))
+                        .Concat((previousMemo?.readByUsers ?? new List<string>()).Select(userName => GetMemoReadIdentityKey(pair.Key, "", userName))),
+                    StringComparer.Ordinal);
+                var nextReadRecords = BuildMemoReadRecords(pair.Value, updatedAt);
+                foreach (var readPair in nextReadRecords)
+                {
+                    if (previousReads.Contains(readPair.Key))
+                        continue;
+
+                    WriteStoreRecord(GetRecordPath("memo-reads", readPair.Key), readPair.Value);
+                }
+            }
+
+            foreach (var pair in previous)
+            {
+                if (next.ContainsKey(pair.Key))
+                    continue;
+
+                WriteStoreRecord(
+                    GetRecordPath("memos", pair.Key),
+                    new MemoRecord
+                    {
+                        item = CloneMemoForStorage(pair.Value),
+                        updatedAt = updatedAt,
+                        deleted = true
+                    });
+            }
+        }
+
+        Dictionary<string, MemoReadRecord> BuildMemoReadRecords(MemoItem memo, long updatedAt)
+        {
+            var records = new Dictionary<string, MemoReadRecord>(StringComparer.Ordinal);
+            if (memo == null || string.IsNullOrEmpty(memo.id))
+                return records;
+
+            CollabIdentityUtility.EnsureReadBy(memo);
+            foreach (var userId in memo.readByUserIds ?? new List<string>())
+            {
+                var key = GetMemoReadIdentityKey(memo.id, userId, "");
+                records[key] = new MemoReadRecord
+                {
+                    memoId = memo.id,
+                    userId = userId ?? "",
+                    userName = "",
+                    updatedAt = updatedAt,
+                    deleted = false
+                };
+            }
+
+            foreach (var userName in memo.readByUsers ?? new List<string>())
+            {
+                var key = GetMemoReadIdentityKey(memo.id, "", userName);
+                if (records.ContainsKey(key))
+                    continue;
+
+                records[key] = new MemoReadRecord
+                {
+                    memoId = memo.id,
+                    userId = "",
+                    userName = userName ?? "",
+                    updatedAt = updatedAt,
+                    deleted = false
+                };
+            }
+
+            return records;
+        }
+
+        void SyncHistoryRecords(List<WorkHistoryItem> previousHistory, List<WorkHistoryItem> nextHistory, long updatedAt)
+        {
+            var existingIds = new HashSet<string>(
+                (previousHistory ?? new List<WorkHistoryItem>())
+                    .Where(item => item != null && !string.IsNullOrEmpty(item.id))
+                    .Select(item => item.id),
+                StringComparer.Ordinal);
+
+            foreach (var item in nextHistory ?? new List<WorkHistoryItem>())
+            {
+                if (item == null || string.IsNullOrEmpty(item.id) || existingIds.Contains(item.id))
+                    continue;
+
+                WriteStoreRecord(
+                    GetRecordPath("history", GetWorkHistoryIdentityKey(item)),
+                    new HistoryRecord
+                    {
+                        item = item,
+                        updatedAt = updatedAt
+                    });
+            }
+        }
+
+        void CreateBackupIfNeeded(CollabStateDocument previousDoc, CollabStateDocument nextDoc)
+        {
             if (!HasMeaningfulChange(previousDoc, nextDoc))
                 return;
 
             if (!ShouldCreateTimedBackup())
                 return;
 
-            WriteBackup(previousText);
+            WriteBackup(ToJson(previousDoc));
         }
 
         bool HasMeaningfulChange(CollabStateDocument previousDoc, CollabStateDocument nextDoc)
@@ -642,14 +1391,9 @@ namespace Ignoranz.CollabSync
         {
             EnsureJsonFileExists();
 
-            if (!TryOpenFile(FileAccess.ReadWrite, FileShare.None, out var stream))
-                return false;
-
-            using (stream)
+            lock (_mutationLock)
             {
-                var previousText = ReadText(stream);
-                var previousWasValid = TryParseDoc(previousText, out var parsedDoc);
-                var baseDoc = previousWasValid ? parsedDoc : ReadLatestBackup();
+                var baseDoc = ReadDoc() ?? new CollabStateDocument();
                 var previousDoc = CloneDoc(baseDoc);
                 var workingDoc = CloneDoc(baseDoc);
 
@@ -662,9 +1406,8 @@ namespace Ignoranz.CollabSync
 
                 workingDoc.updatedAt = TimeUtil.NowMs();
 
-                var nextText = ToStorageText(workingDoc);
-                CreateBackupIfNeeded(previousText, previousWasValid, previousDoc, workingDoc);
-                WriteText(stream, nextText);
+                CreateBackupIfNeeded(previousDoc, workingDoc);
+                WriteDocDelta(previousDoc, workingDoc);
                 return true;
             }
         }

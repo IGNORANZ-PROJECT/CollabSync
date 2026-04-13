@@ -28,6 +28,8 @@ namespace Ignoranz.CollabSync
 
         [Header("Shared State File")]
         public string localJsonPath = CollabSyncBackendUtility.DefaultLocalJsonPath;
+        public bool protectSharedStateFile = true;
+        [HideInInspector] public bool sharedStateProtectionInitialized = true;
 
         [Header("Notifications")]
         public bool notifyOnNewMemo = true;
@@ -69,6 +71,7 @@ namespace Ignoranz.CollabSync
             if (s_cachedEditorAsset != null)
             {
                 RestoreEditorLocalJsonPathPreference(s_cachedEditorAsset);
+                EnsureLegacyDefaults(s_cachedEditorAsset);
                 return s_cachedEditorAsset;
             }
 
@@ -86,6 +89,7 @@ namespace Ignoranz.CollabSync
             }
 
             RestoreEditorLocalJsonPathPreference(asset);
+            EnsureLegacyDefaults(asset);
             s_cachedEditorAsset = asset;
             return asset;
         }
@@ -245,6 +249,16 @@ namespace Ignoranz.CollabSync
             }
 
             StoreEditorLocalJsonPathPreference(asset.localJsonPath);
+        }
+
+        static void EnsureLegacyDefaults(CollabSyncConfig asset)
+        {
+            if (asset == null || asset.sharedStateProtectionInitialized)
+                return;
+
+            asset.protectSharedStateFile = true;
+            asset.sharedStateProtectionInitialized = true;
+            SaveEditorAsset(asset, persistLocalJsonPath: false);
         }
 
         static void StoreEditorLocalJsonPathPreference(string value)

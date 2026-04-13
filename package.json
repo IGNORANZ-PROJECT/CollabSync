@@ -1,6 +1,6 @@
 {
   "name": "com.ignoranz.collabsync",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "displayName": "CollabSync",
   "description": "Lightweight collaboration support for Unity Editor using a shared JSON file.",
   "unity": "2021.3",
